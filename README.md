@@ -47,15 +47,38 @@ python main.py --backbone tst --input fiber_photometry --file photometry.npy --f
 python main.py                      # no args -> GUI
 ```
 
-**Library:**
+**Library (single backbone):**
 ```python
 from embedders_backbones import Embedder
-emb = Embedder(backbone="dtc", n_states=8, epochs=120).fit_spikes(spike_times)
+emb = Embedder(backbone="dtc", epochs=120).fit_spikes(spike_times)  # n_states auto by silhouette
 emb.plot_embeddings("emb.png")          # PCA/t-SNE/UMAP
+emb.plot_state_sequence("states.png")   # state raster (+ optional behaviour)
 emb.animate("traj.gif", method="umap")  # trajectory animation
 emb.run("out_dir")                      # everything + metrics.csv
-print(emb.metrics())                    # circularity, diameter, PR, speed, ...
+print(emb.metrics())                    # silhouette, circularity, diameter, PR, ...
 ```
+
+**Compare several backbones on the same data:**
+```python
+from embedders_backbones import compare_embedders
+cmp = compare_embedders(spike_times, input="spikes",
+                        backbones=["dtc", "tst", "bilstm", "stt", "gatr"], epochs=80)
+cmp.run("compare_out")        # metrics table + figures
+print(cmp.metrics)            # one row per backbone (silhouette, circularity, ...)
+cmp.best("silhouette")        # winning backbone
+```
+or from the CLI: `python main.py --compare dtc,tst,bilstm --input spikes --file spikes.npy`,
+or in the GUI with the **Compare** button.
+
+`compare_out/` holds `comparison_metrics.csv`, `compare_embeddings.png` (each
+backbone's projection side by side), **`compare_state_sequences.png`** (the state
+sequences time-aligned, one row per backbone), and `compare_silhouette.png` /
+`compare_circularity.png` bar charts.
+
+### Number of states
+If you don't pass `n_states`, K is **chosen automatically by silhouette** over
+`[k_min, k_max]` (default 2-10). Pass `n_states=8` to fix it. The chosen K and its
+silhouette are recorded in the metrics (`k_selected_by`, `silhouette_at_k`).
 
 ## Install (optional)
 ```bash
