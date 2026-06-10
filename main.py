@@ -33,13 +33,16 @@ def cli(argv):
                     choices=["spikes", "pose", "mask", "fiber_photometry", "timeseries"])
     ap.add_argument("--file", default=None, help="data file (.npy/.npz/.csv/.pkl); empty = demo")
     ap.add_argument("--out", default=os.path.join(HERE, "embedder_out"))
-    ap.add_argument("--states", type=int, default=8)
+    ap.add_argument("--states", type=int, default=None,
+                    help="number of states K (default: auto, chosen by silhouette)")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--bin-size", type=float, default=0.2)
     ap.add_argument("--time-axis", type=int, default=1)
     ap.add_argument("--fs", type=float, default=None, help="sampling rate (fiber photometry)")
     ap.add_argument("--dff", action="store_true", help="dF/F for fiber photometry")
     ap.add_argument("--gif-method", default="umap", choices=["umap", "tsne", "pca"])
+    ap.add_argument("--compare", default=None,
+                    help="comma list of backbones to run + compare (e.g. dtc,tst,bilstm)")
     args = ap.parse_args(argv)
 
     if args.gui:
@@ -49,19 +52,37 @@ def cli(argv):
             from embedders_backbones import label; print(f"  {b:<12s} {label(b)}")
         return
 
-    emb = Embedder(backbone=args.backbone, bin_size=args.bin_size, n_states=args.states,
-                   epochs=args.epochs, device="auto")
+    # ---- load data once ----
     if not args.file:
         from embedders_backbones.gui import _demo_spikes
         print("[no --file] running the synthetic demo")
-        emb.fit_spikes(_demo_spikes())
+        data, input_kind = _demo_spikes(), "spikes"
     elif args.input == "spikes":
-        emb.fit_spikes(D.load_spikes(args.file))
-    elif args.input == "fiber_photometry":
-        emb.fit_fiber(D.load_array(args.file), time_axis=args.time_axis, dff=args.dff, fs=args.fs)
+        data, input_kind = D.load_spikes(args.file), "spikes"
     else:
-        emb.fit_features(D.load_array(args.file), time_axis=args.time_axis)
+        data, input_kind = D.load_array(args.file), args.input
 
+    # ---- compare several backbones ----
+    if args.compare:
+        from embedders_backbones import compare_embedders
+        bbs = [b.strip() for b in args.compare.split(",") if b.strip()]
+        cmp = compare_embedders(data, input=input_kind, backbones=bbs, time_axis=args.time_axis,
+                                fs=args.fs, dff=args.dff, n_states=args.states,
+                                epochs=args.epochs, device="auto")
+        cmp.run(args.out)
+        print("\ncomparison metrics:\n", cmp.metrics.round(3).to_string(index=False))
+        print(f"\nbest by silhouette: {cmp.best('silhouette')}\noutputs in {args.out}")
+        return
+
+    # ---- single backbone ----
+    emb = Embedder(backbone=args.backbone, bin_size=args.bin_size, n_states=args.states,
+                   epochs=args.epochs, device="auto")
+    if input_kind == "spikes":
+        emb.fit_spikes(data)
+    elif input_kind == "fiber_photometry":
+        emb.fit_fiber(data, time_axis=args.time_axis, dff=args.dff, fs=args.fs)
+    else:
+        emb.fit_features(data, time_axis=args.time_axis)
     met = emb.run(args.out, gif_method=args.gif_method)
     print("\nmetrics:")
     for k, v in met.items():

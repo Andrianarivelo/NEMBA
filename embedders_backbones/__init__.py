@@ -6,9 +6,10 @@ population time series (spikes, pose, segmentation masks, fiber photometry, ...)
 """
 
 from .core import Embedder
+from .compare import compare_embedders, Comparison
 from .backbones import list_backbones, label, make_model, BACKBONES
-from . import data, analysis, viz, backbones
+from . import data, analysis, viz, backbones, compare
 
-__all__ = ["Embedder", "list_backbones", "label", "make_model", "BACKBONES",
-           "data", "analysis", "viz", "backbones"]
+__all__ = ["Embedder", "compare_embedders", "Comparison", "list_backbones", "label",
+           "make_model", "BACKBONES", "data", "analysis", "viz", "backbones", "compare"]
 __version__ = "0.1.0"

@@ -45,7 +45,7 @@ class App:
         self.var_back = tk.StringVar(value="dtc")
         self.var_proj = tk.StringVar(value="umap")
         self.var_color = tk.StringVar(value="time")
-        self.var_states = tk.IntVar(value=8)
+        self.var_states = tk.StringVar(value="auto")
         self.var_epochs = tk.IntVar(value=80)
         self.var_bin = tk.DoubleVar(value=0.2)
         self.var_taxis = tk.IntVar(value=1)
@@ -62,7 +62,7 @@ class App:
             ttk.Label(left, text=lbl).grid(row=r, column=0, sticky="w")
             ttk.Combobox(left, textvariable=var, values=vals, width=27,
                          state="readonly").grid(row=r, column=1, columnspan=2, sticky="w"); r += 1
-        for lbl, var in [("# states (K)", self.var_states), ("Epochs", self.var_epochs),
+        for lbl, var in [("# states (auto/int)", self.var_states), ("Epochs", self.var_epochs),
                          ("Bin size s (spikes)", self.var_bin), ("Time axis (0/1)", self.var_taxis)]:
             ttk.Label(left, text=lbl).grid(row=r, column=0, sticky="w")
             ttk.Entry(left, textvariable=var, width=12).grid(row=r, column=1, sticky="w"); r += 1
@@ -70,10 +70,18 @@ class App:
         ttk.Entry(left, textvariable=self.var_out, width=30).grid(row=r, column=1)
         ttk.Button(left, text="...", width=3, command=self._browse_out).grid(row=r, column=2); r += 1
 
-        self.btn = ttk.Button(left, text="Run", command=self._run)
+        self.btn = ttk.Button(left, text="Run (single backbone)", command=self._run)
         self.btn.grid(row=r, column=0, columnspan=3, sticky="we", pady=6); r += 1
         ttk.Button(left, text="Re-plot projection",
                    command=self._replot).grid(row=r, column=0, columnspan=3, sticky="we"); r += 1
+        ttk.Separator(left, orient="horizontal").grid(row=r, column=0, columnspan=3,
+                                                      sticky="we", pady=6); r += 1
+        ttk.Label(left, text="Compare backbones").grid(row=r, column=0, sticky="w")
+        self.var_compare = tk.StringVar(value="dtc,tst,bilstm")
+        ttk.Entry(left, textvariable=self.var_compare, width=27).grid(
+            row=r, column=1, columnspan=2, sticky="w"); r += 1
+        self.btn_cmp = ttk.Button(left, text="Compare", command=self._compare)
+        self.btn_cmp.grid(row=r, column=0, columnspan=3, sticky="we"); r += 1
 
         self.log = tk.Text(left, width=44, height=18, font=("Consolas", 8))
         self.log.grid(row=r, column=0, columnspan=3, pady=6)
@@ -116,8 +124,9 @@ class App:
     def _run_worker(self):
         try:
             kind, payload = self._load_input()
+            ns = self.var_states.get().strip() or "auto"
             emb = Embedder(backbone=self.var_back.get(), bin_size=self.var_bin.get(),
-                           n_states=self.var_states.get(), epochs=self.var_epochs.get(),
+                           n_states=ns, epochs=self.var_epochs.get(),
                            device="auto", log=self._msg)
             self._msg(f"== {label(self.var_back.get())} on {kind} ==")
             if kind == "demo":
@@ -143,6 +152,37 @@ class App:
     def _replot(self):
         if self.emb is not None:
             self._draw()
+
+    def _compare(self):
+        self.btn_cmp.config(state="disabled")
+        threading.Thread(target=self._compare_worker, daemon=True).start()
+
+    def _compare_worker(self):
+        try:
+            from .compare import compare_embedders
+            from . import viz as V
+            bbs = [b.strip() for b in self.var_compare.get().split(",") if b.strip()]
+            kind, payload = self._load_input()
+            data = _demo_spikes() if kind == "demo" else payload
+            ikind = "spikes" if kind in ("demo", "spikes") else kind
+            ns = self.var_states.get().strip() or "auto"
+            self._msg(f"== comparing {bbs} on {ikind} ==")
+            cmp = compare_embedders(data, input=ikind, backbones=bbs,
+                                    time_axis=self.var_taxis.get(), n_states=ns,
+                                    epochs=self.var_epochs.get(), device="auto", log=self._msg)
+            out = os.path.join(self.var_out.get(), "compare"); cmp.run(out)
+            self._cmp = cmp
+            self._msg("\n" + cmp.metrics.round(3).to_string(index=False))
+            self._msg(f"best by silhouette: {cmp.best('silhouette')}")
+            self.fig.clear()
+            V.compare_embeddings_figure(cmp.embedders, method=self.var_proj.get(),
+                                        color=self.var_color.get(), fig=self.fig)
+            self.canvas.draw()
+            self._msg(f"saved comparison (metrics + figures) to {out}")
+        except Exception as exc:  # noqa: BLE001
+            self._msg("ERROR: " + repr(exc)); self._msg(traceback.format_exc())
+        finally:
+            self.root.after(0, lambda: self.btn_cmp.config(state="normal"))
 
     def _draw(self):
         self.fig.clear()

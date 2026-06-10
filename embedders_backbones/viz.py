@@ -84,6 +84,86 @@ def state_sequence(states, save_path, times=None, behavior=None, title="state se
     return save_path
 
 
+def state_sequences_panel(seqs, save_path, times=None, behavior=None, behavior_name="behaviour",
+                          title="state sequences"):
+    """Stack several state sequences (dict {name: states}) as time-aligned rasters,
+    with an optional behaviour track at the bottom. Lets you compare how different
+    embedders segment the same recording."""
+    names = list(seqs)
+    n = len(names)
+    t = (np.arange(len(seqs[names[0]])) if times is None else np.asarray(times))
+    nrow = n + (1 if behavior is not None else 0)
+    fig, axes = plt.subplots(nrow, 1, figsize=(13, 0.7 * nrow + 1.0), squeeze=False)
+    for i, nm in enumerate(names):
+        s = np.asarray(seqs[nm]); K = int(s.max()) + 1 if s.size else 1
+        cmap = ListedColormap([plt.get_cmap("tab10")(j % 10) for j in range(max(K, 1))])
+        ax = axes[i][0]
+        ax.imshow(s[None, :], aspect="auto", cmap=cmap,
+                  norm=BoundaryNorm(np.arange(-0.5, K + 0.5, 1), cmap.N),
+                  extent=[t[0], t[-1], 0, 1], interpolation="nearest")
+        ax.set_yticks([]); ax.set_ylabel(nm, rotation=0, ha="right", va="center", fontsize=8)
+        ax.set_xticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    if behavior is not None:
+        axb = axes[n][0]; beh = np.asarray(behavior)
+        if beh.dtype.kind in "iu" and beh.max() > 1:
+            bK = int(beh.max()) + 1
+            bcm = ListedColormap([plt.get_cmap("tab20")(j % 20) for j in range(bK)])
+            axb.imshow(beh[None, :], aspect="auto", cmap=bcm,
+                       norm=BoundaryNorm(np.arange(-0.5, bK + 0.5, 1), bcm.N),
+                       extent=[t[0], t[-1], 0, 1], interpolation="nearest")
+        else:
+            axb.fill_between(t, 0, beh, step="mid", color="#c1121f", lw=0)
+            axb.set_xlim(t[0], t[-1]); axb.set_ylim(0, 1)
+        axb.set_yticks([]); axb.set_ylabel(behavior_name, rotation=0, ha="right", va="center", fontsize=8)
+        for sp in ("top", "right", "left"):
+            axb.spines[sp].set_visible(False)
+    axes[-1][0].set_xlabel("time")
+    fig.suptitle(title); fig.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    return save_path
+
+
+def compare_embeddings_figure(embedders, method="umap", color="state", seed=0, fig=None,
+                              title="embeddings compared"):
+    """Grid of each backbone's 2-D embedding; returns the Figure (for GUI or save)."""
+    names = list(embedders)
+    n = len(names); ncol = min(4, n); nrow = int(np.ceil(n / ncol))
+    if fig is None:
+        fig = Figure(figsize=(3.6 * ncol, 3.4 * nrow))
+    axes = np.atleast_1d(fig.subplots(nrow, ncol, squeeze=False)).ravel()
+    for ax in axes:
+        ax.axis("off")
+    for i, nm in enumerate(names):
+        emb = embedders[nm]; Z = emb.embedding(); st = emb.state_sequence()
+        c, cmap = _colors(len(Z), color, st)
+        P = project(Z, method, seed)
+        ax = axes[i]; ax.axis("on")
+        ax.scatter(P[:, 0], P[:, 1], c=c, cmap=cmap, s=4, alpha=0.7, linewidths=0)
+        ax.set_title(nm, fontsize=10); ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(f"{title} ({method.upper()}, coloured by {color})", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def compare_embeddings_panel(embedders, save_path, **kw):
+    fig = compare_embeddings_figure(embedders, **kw)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    return save_path
+
+
+def compare_bar(df, metric, save_path, title=None):
+    """Horizontal bar comparison of a metric across backbones (sorted)."""
+    g = df.set_index("backbone")[metric].dropna().sort_values()
+    fig, ax = plt.subplots(figsize=(7, 0.5 * len(g) + 1.2))
+    ax.barh(range(len(g)), g.values, color="#1b9e77", edgecolor="k", lw=0.4)
+    ax.set_yticks(range(len(g))); ax.set_yticklabels(g.index)
+    ax.set_xlabel(metric); ax.set_title(title or f"{metric} by backbone")
+    fig.tight_layout(); fig.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    return save_path
+
+
 def trajectory_gif(Z, save_path, method="umap", seed=0, n_frames=120, tail=45, fps=20,
                    title="trajectory"):
     P = project(Z, method, seed)

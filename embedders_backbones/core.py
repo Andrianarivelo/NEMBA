@@ -22,15 +22,21 @@ from . import viz as _viz
 
 
 class Embedder:
-    def __init__(self, backbone="dtc", *, bin_size=0.2, embedding_dim=32, n_states=8,
-                 epochs=120, win_len=256, stride=128, batch=16, mask_ratio=0.4,
-                 mask_span=16, smooth_sigma=4.0, device="auto", seed=0, log=print):
+    def __init__(self, backbone="dtc", *, bin_size=0.2, embedding_dim=32, n_states=None,
+                 k_min=2, k_max=10, epochs=120, win_len=256, stride=128, batch=16,
+                 mask_ratio=0.4, mask_span=16, smooth_sigma=4.0, device="auto",
+                 seed=0, log=print):
         if backbone not in BK.BACKBONES:
             raise ValueError(f"unknown backbone {backbone!r}; choose {BK.list_backbones()}")
         self.backbone = backbone
         self.bin_size = bin_size
         self.embedding_dim = embedding_dim
-        self.n_states = n_states
+        # n_states None / "auto" -> pick K by silhouette over [k_min, k_max]
+        self.n_states = None if (n_states in (None, "auto", 0)) else int(n_states)
+        self.k_min = k_min
+        self.k_max = k_max
+        self.n_states_used = None
+        self.silhouette_scores = None
         self.epochs = epochs
         self.win_len = win_len
         self.stride = stride
@@ -74,7 +80,15 @@ class Embedder:
             device=self.device, seed=self.seed, log=self.log)
         Z = _an.embed_sequence(self.net, X, self.embedding_dim, self.win_len, self.device)
         self.Z = _an.smooth_standardize(Z, self.smooth_sigma)
-        self.states = _an.cluster(self.backbone, self.Z, self.n_states, self.seed)
+        if self.n_states is None:
+            k, self.silhouette_scores = _an.auto_k(self.Z, self.k_min, self.k_max, self.seed)
+            self.n_states_used = k
+            if self.log:
+                self.log(f"[{self.backbone}] auto K by silhouette -> K={k} "
+                         f"(sil={self.silhouette_scores[k]:.3f})")
+        else:
+            self.n_states_used = self.n_states
+        self.states = _an.cluster(self.backbone, self.Z, self.n_states_used, self.seed)
         self._proj = {}
         return self
 
@@ -96,7 +110,11 @@ class Embedder:
         self._check()
         m = _an.metrics(self.Z, self.seed)
         m.update(backbone=self.backbone, n_channels=int(self.X.shape[0]),
-                 n_bins=int(self.X.shape[1]), n_states=int(np.unique(self.states).size))
+                 n_bins=int(self.X.shape[1]), n_states=int(np.unique(self.states).size),
+                 silhouette=_an.cluster_silhouette(self.Z, self.states, self.seed),
+                 k_selected_by=("silhouette" if self.n_states is None else "user"))
+        if self.silhouette_scores is not None and self.n_states_used in self.silhouette_scores:
+            m["silhouette_at_k"] = self.silhouette_scores[self.n_states_used]
         return m
 
     # ----- figures ----- #

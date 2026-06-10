@@ -17,6 +17,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
 
 from . import backbones as BK
 from .backbones import (make_model, make_span_mask, masked_reconstruction_loss,
@@ -106,6 +107,39 @@ def smooth_standardize(Z, sigma=4.0):
 # --------------------------------------------------------------------------- #
 # clustering (kmeans / DEC / CRF, dispatched by backbone)                     #
 # --------------------------------------------------------------------------- #
+
+def auto_k(Z, k_min=2, k_max=10, seed=0, sample=3000):
+    """Pick the number of states by maximising the KMeans silhouette score over
+    K in [k_min, k_max]. Returns (best_k, {k: silhouette})."""
+    rng = np.random.default_rng(seed)
+    idx = (rng.choice(len(Z), sample, replace=False) if len(Z) > sample
+           else np.arange(len(Z)))
+    Zs = Z[idx]
+    scores, best_k, best_s = {}, k_min, -1.0
+    for k in range(k_min, min(k_max, len(Zs) - 1) + 1):
+        try:
+            lab = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(Zs)
+            s = float(silhouette_score(Zs, lab))
+        except Exception:  # noqa: BLE001
+            s = -1.0
+        scores[k] = s
+        if s > best_s:
+            best_s, best_k = s, k
+    return best_k, scores
+
+
+def cluster_silhouette(Z, labels, seed=0, sample=3000):
+    """Silhouette of a state labelling on the embedding (cluster separation)."""
+    labels = np.asarray(labels)
+    if np.unique(labels).size < 2:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    idx = (rng.choice(len(Z), sample, replace=False) if len(Z) > sample else np.arange(len(Z)))
+    try:
+        return float(silhouette_score(Z[idx], labels[idx]))
+    except Exception:  # noqa: BLE001
+        return float("nan")
+
 
 def cluster(name, Z, k=8, seed=0):
     kind = BK.clustering_kind(name)
