@@ -25,7 +25,7 @@ class Embedder:
     def __init__(self, backbone="dtc", *, bin_size=0.2, embedding_dim=32, n_states=None,
                  k_min=2, k_max=10, epochs=120, win_len=256, stride=128, batch=16,
                  mask_ratio=0.4, mask_span=16, smooth_sigma=4.0, device="auto",
-                 seed=0, log=print):
+                 seed=0, log=print, model_kwargs=None):
         if backbone not in BK.BACKBONES:
             raise ValueError(f"unknown backbone {backbone!r}; choose {BK.list_backbones()}")
         self.backbone = backbone
@@ -47,6 +47,7 @@ class Embedder:
         self.device = device
         self.seed = seed
         self.log = log
+        self.model_kwargs = model_kwargs or {}
         self.X = self.times = self.net = self.Z = self.states = self.losses = None
         self._proj = {}
 
@@ -58,6 +59,15 @@ class Embedder:
     def fit_features(self, X, time_axis=1, times=None):
         Xz, times = _data.features_to_matrix(X, time_axis=time_axis, times=times)
         return self._fit(Xz, times)
+
+    def fit_coco_masks(self, coco, *, resize=(64, 64), channel_key=None,
+                       category_ids=None, track_ids=None, fps=None,
+                       standardize=True):
+        X, times = _data.coco_masks_to_matrix(
+            coco, resize=resize, channel_key=channel_key,
+            category_ids=category_ids, track_ids=track_ids, fps=fps,
+            standardize=standardize)
+        return self._fit(X, times)
 
     def fit_fiber(self, signal, time_axis=1, times=None, dff=False, fs=None):
         Xz, times = _data.fiber_photometry_to_matrix(signal, time_axis, times, dff, fs)
@@ -77,7 +87,8 @@ class Embedder:
             self.backbone, X, embedding_dim=self.embedding_dim, epochs=self.epochs,
             win_len=self.win_len, stride=self.stride, batch=self.batch,
             mask_ratio=self.mask_ratio, mask_span=self.mask_span,
-            device=self.device, seed=self.seed, log=self.log)
+            device=self.device, seed=self.seed, log=self.log,
+            model_kwargs=self.model_kwargs)
         Z = _an.embed_sequence(self.net, X, self.embedding_dim, self.win_len, self.device)
         self.Z = _an.smooth_standardize(Z, self.smooth_sigma)
         if self.n_states is None:

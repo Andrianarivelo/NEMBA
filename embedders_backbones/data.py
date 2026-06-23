@@ -2,17 +2,22 @@
 (channels x time), z-scored per channel.
 
   spike trains      -> spikes_to_matrix         (list of spike-time arrays)
-  pose / mask / any -> features_to_matrix        ([features, time] or [time, features])
+  pose / any feature -> features_to_matrix       ([features, time] or [time, features])
+  COCO masks      -> coco_masks_to_matrix        (raw raster masks -> [pixels, time])
   fiber photometry  -> fiber_photometry_to_matrix(continuous signal(s), optional dF/F)
   generic series    -> features_to_matrix / load_array
 
-File loaders accept .npy / .npz / .csv (and pickle for spikes).
+File loaders accept .npy / .npz / .csv / COCO .json (and pickle for spikes).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import numpy as np
+from PIL import Image, ImageDraw
+
+_NEAREST = getattr(getattr(Image, "Resampling", Image), "NEAREST")
 
 
 def zscore_rows(X: np.ndarray) -> np.ndarray:
@@ -67,6 +72,211 @@ def features_to_matrix(X, time_axis: int = 1, times=None):
     if times is None:
         times = np.arange(Xz.shape[1], dtype=float)
     return Xz, np.asarray(times, float)
+
+
+# --------------------------------------------------------------------------- #
+# direct COCO segmentation masks                                               #
+# --------------------------------------------------------------------------- #
+
+def coco_masks_to_matrix(coco, *, resize=(64, 64), channel_key: str | None = None,
+                         category_ids=None, track_ids=None, times=None,
+                         fps: float | None = None, standardize: bool = True,
+                         bbox_fallback: bool = True):
+    """Rasterize COCO JSON masks directly into a model-ready [C, T] matrix.
+
+    Each time step is a binary mask image, optionally split into stable channels
+    by ``track_id`` or ``category_id``, then flattened to pixels-over-time. No
+    geometry features such as area, centroid, contours, or skeletons are
+    extracted.
+    """
+    if isinstance(coco, (str, os.PathLike)):
+        with open(coco, "r", encoding="utf-8") as fh:
+            coco = json.load(fh)
+    if not isinstance(coco, dict):
+        raise ValueError("coco must be a dict or a path to a COCO JSON file")
+
+    resize_hw = _parse_resize(resize)
+    images = list(coco.get("images", []))
+    if not images:
+        raise ValueError("COCO payload has no images")
+    images = sorted(images, key=_image_sort_key)
+    image_by_id = {img.get("id"): img for img in images}
+    frame_index = {img.get("id"): idx for idx, img in enumerate(images)}
+
+    cat_filter = set(category_ids) if category_ids is not None else None
+    track_filter = set(track_ids) if track_ids is not None else None
+    anns_by_image: dict[object, list[dict]] = {img.get("id"): [] for img in images}
+    channel_values = []
+    for ann in coco.get("annotations", []):
+        image_id = ann.get("image_id")
+        if image_id not in image_by_id:
+            continue
+        if cat_filter is not None and ann.get("category_id") not in cat_filter:
+            continue
+        if track_filter is not None and ann.get("track_id") not in track_filter:
+            continue
+        anns_by_image.setdefault(image_id, []).append(ann)
+        if channel_key not in (None, "union"):
+            channel_values.append(ann.get(channel_key, "missing"))
+
+    if channel_key in (None, "union"):
+        channels = ["union"]
+    else:
+        channels = sorted(set(channel_values), key=lambda x: (str(type(x)), str(x)))
+        if not channels:
+            channels = ["missing"]
+    channel_to_idx = {value: idx for idx, value in enumerate(channels)}
+
+    height, width = resize_hw
+    video = np.zeros((len(channels), len(images), height, width), dtype=np.float32)
+    for image_id, anns in anns_by_image.items():
+        img = image_by_id[image_id]
+        frame = frame_index[image_id]
+        src_hw = (int(img.get("height", height)), int(img.get("width", width)))
+        for ann in anns:
+            key = "union" if channel_key in (None, "union") else ann.get(channel_key, "missing")
+            channel = channel_to_idx.get(key)
+            if channel is None:
+                continue
+            mask = _annotation_mask(ann, src_hw, resize_hw, bbox_fallback=bbox_fallback)
+            video[channel, frame] = np.maximum(video[channel, frame], mask)
+
+    X = video.transpose(0, 2, 3, 1).reshape(len(channels) * height * width, len(images))
+    if standardize:
+        X = zscore_rows(X)
+    if times is None:
+        times = _times_from_images(images, fps=fps)
+    return X.astype(np.float32), np.asarray(times, float)
+
+
+def load_coco_masks(path: str, **kwargs):
+    """Load a COCO JSON file as direct raw mask pixels over time."""
+    return coco_masks_to_matrix(path, **kwargs)
+
+
+def _parse_resize(resize) -> tuple[int, int]:
+    if isinstance(resize, int):
+        return int(resize), int(resize)
+    if len(resize) != 2:
+        raise ValueError("resize must be an int or a (height, width) pair")
+    return int(resize[0]), int(resize[1])
+
+
+def _image_sort_key(img: dict):
+    for key in ("frame_index", "frame_id", "frame", "index"):
+        if key in img:
+            return (0, int(img[key]))
+    file_name = str(img.get("file_name", ""))
+    digits = "".join(ch if ch.isdigit() else " " for ch in file_name).split()
+    if digits:
+        return (1, int(digits[-1]))
+    return (2, int(img.get("id", 0)))
+
+
+def _times_from_images(images: list[dict], fps: float | None = None) -> np.ndarray:
+    values = []
+    has_time = False
+    for idx, img in enumerate(images):
+        if "time" in img:
+            values.append(float(img["time"])); has_time = True
+        elif "timestamp" in img:
+            values.append(float(img["timestamp"])); has_time = True
+        elif fps:
+            values.append(idx / float(fps))
+        else:
+            for key in ("frame_index", "frame_id", "frame", "index"):
+                if key in img:
+                    values.append(float(img[key])); break
+            else:
+                values.append(float(idx))
+    return np.asarray(values if has_time or fps else np.arange(len(images), dtype=float), float)
+
+
+def _annotation_mask(ann: dict, src_hw: tuple[int, int], dst_hw: tuple[int, int],
+                     bbox_fallback: bool = True) -> np.ndarray:
+    segmentation = ann.get("segmentation")
+    if segmentation:
+        mask = _decode_segmentation(segmentation, src_hw)
+    elif bbox_fallback and ann.get("bbox") is not None:
+        mask = _bbox_mask(ann["bbox"], src_hw)
+    else:
+        mask = np.zeros(src_hw, dtype=np.uint8)
+    if src_hw != dst_hw:
+        img = Image.fromarray((mask > 0).astype(np.uint8) * 255)
+        img = img.resize((dst_hw[1], dst_hw[0]), _NEAREST)
+        mask = (np.asarray(img) > 0).astype(np.float32)
+    return mask.astype(np.float32)
+
+
+def _decode_segmentation(segmentation, src_hw: tuple[int, int]) -> np.ndarray:
+    if isinstance(segmentation, list):
+        return _polygon_mask(segmentation, src_hw)
+    if isinstance(segmentation, dict):
+        counts = segmentation.get("counts")
+        size = tuple(segmentation.get("size", src_hw))
+        if isinstance(counts, list):
+            return _rle_counts_mask(counts, size, src_hw)
+        return _compressed_rle_mask(segmentation, src_hw)
+    raise ValueError(f"unsupported COCO segmentation type: {type(segmentation).__name__}")
+
+
+def _polygon_mask(polygons, src_hw: tuple[int, int]) -> np.ndarray:
+    height, width = src_hw
+    img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(img)
+    for poly in polygons:
+        if not poly or len(poly) < 6:
+            continue
+        coords = [(float(poly[i]), float(poly[i + 1])) for i in range(0, len(poly), 2)]
+        draw.polygon(coords, outline=1, fill=1)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _bbox_mask(bbox, src_hw: tuple[int, int]) -> np.ndarray:
+    height, width = src_hw
+    x, y, w, h = [float(v) for v in bbox]
+    x0, y0 = max(int(np.floor(x)), 0), max(int(np.floor(y)), 0)
+    x1, y1 = min(int(np.ceil(x + w)), width), min(int(np.ceil(y + h)), height)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[y0:y1, x0:x1] = 1
+    return mask
+
+
+def _rle_counts_mask(counts: list[int], size: tuple[int, int], src_hw: tuple[int, int]) -> np.ndarray:
+    height, width = int(size[0]), int(size[1])
+    flat = np.zeros(height * width, dtype=np.uint8)
+    idx = 0
+    value = 0
+    for run in counts:
+        run = int(run)
+        if value == 1:
+            flat[idx:idx + run] = 1
+        idx += run
+        value = 1 - value
+    mask = flat.reshape((height, width), order="F")
+    if (height, width) != src_hw:
+        img = Image.fromarray(mask * 255)
+        img = img.resize((src_hw[1], src_hw[0]), _NEAREST)
+        mask = (np.asarray(img) > 0).astype(np.uint8)
+    return mask
+
+
+def _compressed_rle_mask(segmentation: dict, src_hw: tuple[int, int]) -> np.ndarray:
+    try:
+        from pycocotools import mask as mask_utils  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            "compressed COCO RLE requires pycocotools; install it or export "
+            "polygon/uncompressed RLE segmentations"
+        ) from exc
+    decoded = mask_utils.decode(segmentation)
+    if decoded.ndim == 3:
+        decoded = decoded.max(axis=2)
+    if decoded.shape != src_hw:
+        img = Image.fromarray((decoded > 0).astype(np.uint8) * 255)
+        img = img.resize((src_hw[1], src_hw[0]), _NEAREST)
+        decoded = np.asarray(img) > 0
+    return decoded.astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #

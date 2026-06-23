@@ -12,6 +12,7 @@ dependencies = ["numpy", "scipy", "scikit-learn", "matplotlib", "pandas", "pillo
 
 [project.optional-dependencies]
 full = ["umap-learn", "ripser", "persim"]
+coco = ["pycocotools"]
 
 [project.scripts]
 embedders-backbones = "main:main"

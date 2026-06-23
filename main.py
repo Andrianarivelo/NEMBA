@@ -9,7 +9,7 @@ opens the small GUI. With arguments it runs the CLI:
     python main.py --list                                 # list backbones
     python main.py                                        # no args -> GUI
 
-Input types: spikes | pose | mask | fiber_photometry | timeseries.
+Input types: spikes | pose | mask | coco_mask | fiber_photometry | timeseries.
 Add the package to the path automatically, so no install is needed.
 """
 
@@ -30,16 +30,21 @@ def cli(argv):
     ap.add_argument("--list", action="store_true", help="list available backbones")
     ap.add_argument("--backbone", default="dtc")
     ap.add_argument("--input", default="spikes",
-                    choices=["spikes", "pose", "mask", "fiber_photometry", "timeseries"])
-    ap.add_argument("--file", default=None, help="data file (.npy/.npz/.csv/.pkl); empty = demo")
+                    choices=["spikes", "pose", "mask", "coco_mask", "fiber_photometry", "timeseries"])
+    ap.add_argument("--file", default=None, help="data file (.npy/.npz/.csv/.json/.pkl); empty = demo")
     ap.add_argument("--out", default=os.path.join(HERE, "embedder_out"))
     ap.add_argument("--states", type=int, default=None,
                     help="number of states K (default: auto, chosen by silhouette)")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--bin-size", type=float, default=0.2)
     ap.add_argument("--time-axis", type=int, default=1)
-    ap.add_argument("--fs", type=float, default=None, help="sampling rate (fiber photometry)")
+    ap.add_argument("--fs", type=float, default=None,
+                    help="sampling rate for fiber photometry or direct mask videos")
     ap.add_argument("--dff", action="store_true", help="dF/F for fiber photometry")
+    ap.add_argument("--mask-size", type=int, default=64,
+                    help="square raster size for direct COCO masks")
+    ap.add_argument("--mask-channel-key", default=None,
+                    help="COCO annotation key for separate mask channels, e.g. track_id")
     ap.add_argument("--gif-method", default="umap", choices=["umap", "tsne", "pca"])
     ap.add_argument("--compare", default=None,
                     help="comma list of backbones to run + compare (e.g. dtc,tst,bilstm)")
@@ -59,6 +64,8 @@ def cli(argv):
         data, input_kind = _demo_spikes(), "spikes"
     elif args.input == "spikes":
         data, input_kind = D.load_spikes(args.file), "spikes"
+    elif args.input == "coco_mask" or (args.input == "mask" and args.file.endswith(".json")):
+        data, input_kind = args.file, "coco_mask"
     else:
         data, input_kind = D.load_array(args.file), args.input
 
@@ -68,6 +75,8 @@ def cli(argv):
         bbs = [b.strip() for b in args.compare.split(",") if b.strip()]
         cmp = compare_embedders(data, input=input_kind, backbones=bbs, time_axis=args.time_axis,
                                 fs=args.fs, dff=args.dff, n_states=args.states,
+                                mask_resize=(args.mask_size, args.mask_size),
+                                mask_channel_key=args.mask_channel_key,
                                 epochs=args.epochs, device="auto")
         cmp.run(args.out)
         print("\ncomparison metrics:\n", cmp.metrics.round(3).to_string(index=False))
@@ -79,6 +88,9 @@ def cli(argv):
                    epochs=args.epochs, device="auto")
     if input_kind == "spikes":
         emb.fit_spikes(data)
+    elif input_kind == "coco_mask":
+        emb.fit_coco_masks(data, resize=(args.mask_size, args.mask_size),
+                           channel_key=args.mask_channel_key, fps=args.fs)
     elif input_kind == "fiber_photometry":
         emb.fit_fiber(data, time_axis=args.time_axis, dff=args.dff, fs=args.fs)
     else:

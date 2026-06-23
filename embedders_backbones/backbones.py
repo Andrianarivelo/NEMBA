@@ -15,6 +15,7 @@ import torch.nn as nn
 from . import _transformers as T
 from . import _bilstm as B
 from . import _embtcn as E
+from . import _tcn_variants as V
 from ._embtcn import make_span_mask, masked_reconstruction_loss   # re-export
 from ._transformers import neuron_graph, DECAutoencoder, target_distribution, LinearChainCRF
 
@@ -32,6 +33,18 @@ BACKBONES = {
     "rcnn":        ("Recurrent CNN",                 "kmeans", False),
     "patchtst":    ("PatchTST",                      "kmeans", False),
     "embtcn":      ("EmbTCN-Attention",              "kmeans", False),
+    "tcn":          ("Generic Residual TCN",          "kmeans", False),
+    "ed_tcn":       ("Encoder-Decoder TCN",           "kmeans", False),
+    "dilated_tcn":  ("Dilated/WaveNet TCN",           "kmeans", False),
+    "ms_tcn":       ("Multi-Stage TCN",               "kmeans", False),
+    "ms_tcnpp":     ("MS-TCN++ Dual-Dilated",         "kmeans", False),
+    "c2f_tcn":      ("Coarse-to-Fine TCN",            "kmeans", False),
+    "stcn":         ("Stochastic TCN",                "kmeans", False),
+    "c_tcn":        ("Concept-wise TCN",              "kmeans", False),
+    "dc_tcn":       ("Densely Connected TCN",         "kmeans", False),
+    "nac_tcn":      ("Neighborhood Attention TCN",    "kmeans", False),
+    "dwa_tcn":      ("Dynamic Alignment TCN",         "kmeans", False),
+    "pit_tcn":      ("Pruning-in-Time TCN",           "kmeans", False),
 }
 
 
@@ -68,4 +81,7 @@ def make_model(name: str, num_features: int, embedding_dim: int = 32,
     if name == "embtcn":
         return E.NeuralEmbTCN(E.NeuralEmbTCNConfig(
             num_features=num_features, embedding_dim=embedding_dim, max_len=max_len, **overrides))
+    if name in V.MODEL_REGISTRY:
+        return V.make_tcn_model(name, num_features, embedding_dim=embedding_dim,
+                                max_len=max_len, **overrides)
     raise ValueError(f"unknown backbone {name!r}; choose from {list_backbones()}")

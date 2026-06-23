@@ -25,7 +25,7 @@ from . import data as _data
 from .core import Embedder
 from .backbones import list_backbones, label
 
-INPUT_TYPES = ["spikes", "pose", "mask", "fiber_photometry", "timeseries"]
+INPUT_TYPES = ["spikes", "pose", "mask", "coco_mask", "fiber_photometry", "timeseries"]
 PROJECTIONS = ["umap", "tsne", "pca"]
 
 
@@ -49,6 +49,8 @@ class App:
         self.var_epochs = tk.IntVar(value=80)
         self.var_bin = tk.DoubleVar(value=0.2)
         self.var_taxis = tk.IntVar(value=1)
+        self.var_mask_size = tk.IntVar(value=64)
+        self.var_mask_key = tk.StringVar(value="")
         self.var_out = tk.StringVar(value=os.path.join(os.getcwd(), "embedder_out"))
 
         r = 0
@@ -63,7 +65,8 @@ class App:
             ttk.Combobox(left, textvariable=var, values=vals, width=27,
                          state="readonly").grid(row=r, column=1, columnspan=2, sticky="w"); r += 1
         for lbl, var in [("# states (auto/int)", self.var_states), ("Epochs", self.var_epochs),
-                         ("Bin size s (spikes)", self.var_bin), ("Time axis (0/1)", self.var_taxis)]:
+                         ("Bin size s (spikes)", self.var_bin), ("Time axis (0/1)", self.var_taxis),
+                         ("Mask raster size", self.var_mask_size), ("Mask channel key", self.var_mask_key)]:
             ttk.Label(left, text=lbl).grid(row=r, column=0, sticky="w")
             ttk.Entry(left, textvariable=var, width=12).grid(row=r, column=1, sticky="w"); r += 1
         ttk.Label(left, text="Output dir").grid(row=r, column=0, sticky="w")
@@ -95,7 +98,7 @@ class App:
 
     # ---- helpers ----
     def _browse(self):
-        p = filedialog.askopenfilename(filetypes=[("data", "*.npy *.npz *.csv *.pkl"), ("all", "*.*")])
+        p = filedialog.askopenfilename(filetypes=[("data", "*.npy *.npz *.csv *.json *.pkl"), ("all", "*.*")])
         if p:
             self.var_file.set(p)
 
@@ -114,6 +117,8 @@ class App:
             return ("demo", None)
         if typ == "spikes":
             return ("spikes", _data.load_spikes(path))
+        if typ == "coco_mask" or (typ == "mask" and path.endswith(".json")):
+            return ("coco_mask", path)
         return (typ, _data.load_array(path))
 
     # ---- run ----
@@ -133,6 +138,10 @@ class App:
                 emb.fit_spikes(_demo_spikes())
             elif kind == "spikes":
                 emb.fit_spikes(payload)
+            elif kind == "coco_mask":
+                key = self.var_mask_key.get().strip() or None
+                emb.fit_coco_masks(payload, resize=(self.var_mask_size.get(), self.var_mask_size.get()),
+                                   channel_key=key)
             elif kind == "fiber_photometry":
                 emb.fit_fiber(payload, time_axis=self.var_taxis.get())
             else:
@@ -169,6 +178,8 @@ class App:
             self._msg(f"== comparing {bbs} on {ikind} ==")
             cmp = compare_embedders(data, input=ikind, backbones=bbs,
                                     time_axis=self.var_taxis.get(), n_states=ns,
+                                    mask_resize=(self.var_mask_size.get(), self.var_mask_size.get()),
+                                    mask_channel_key=(self.var_mask_key.get().strip() or None),
                                     epochs=self.var_epochs.get(), device="auto", log=self._msg)
             out = os.path.join(self.var_out.get(), "compare"); cmp.run(out)
             self._cmp = cmp

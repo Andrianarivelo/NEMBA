@@ -58,10 +58,11 @@ def make_windows(X, L, stride):
 
 def train(name, X, *, embedding_dim=32, epochs=120, win_len=256, stride=128, batch=16,
           lr=1e-3, weight_decay=1e-4, mask_ratio=0.4, mask_span=16, device="auto",
-          seed=0, log=print):
+          seed=0, log=print, model_kwargs=None):
     dev = resolve_device(device)
     torch.manual_seed(seed); np.random.seed(seed)
-    net = make_model(name, X.shape[0], embedding_dim=embedding_dim, max_len=win_len).to(dev)
+    net = make_model(name, X.shape[0], embedding_dim=embedding_dim, max_len=win_len,
+                     **(model_kwargs or {})).to(dev)
     if BK.needs_graph(name):
         net.set_graph(neuron_graph(X, top_k=min(8, max(X.shape[0] - 1, 1))))
     net.train()
@@ -78,9 +79,12 @@ def train(name, X, *, embedding_dim=32, epochs=120, win_len=256, stride=128, bat
                                   device=dev, generator=gen)
             out = net(xb, mask)
             loss = masked_reconstruction_loss(xb, out.reconstruction, mask)
+            aux_loss = getattr(out, "aux_loss", None)
+            if aux_loss is not None:
+                loss = loss + aux_loss
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0); opt.step()
-            ep_loss += float(loss); nb += 1
+            ep_loss += float(loss.detach()); nb += 1
         losses.append(ep_loss / max(nb, 1))
         if log and (ep % 20 == 0 or ep == epochs - 1):
             log(f"  epoch {ep:3d}/{epochs}  loss={losses[-1]:.4f}")

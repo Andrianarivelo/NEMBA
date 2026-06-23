@@ -23,10 +23,11 @@ _METRIC_COLS = ["backbone", "n_states", "silhouette", "circularity", "diameter",
 
 
 def compare_embedders(data, input="spikes", backbones=None, *, time_axis=1, fs=None,
-                      dff=False, behavior=None, log=print, **embedder_kw):
+                      dff=False, behavior=None, log=print, mask_resize=(64, 64),
+                      mask_channel_key=None, **embedder_kw):
     """Fit several backbones on the same data; return a ``Comparison``.
 
-    ``input`` is one of spikes | pose | mask | fiber_photometry | timeseries.
+    ``input`` is one of spikes | pose | mask | coco_mask | fiber_photometry | timeseries.
     ``backbones`` defaults to a representative set. Extra kwargs (epochs, n_states,
     device, seed, ...) are passed to every ``Embedder``.
     """
@@ -38,6 +39,8 @@ def compare_embedders(data, input="spikes", backbones=None, *, time_axis=1, fs=N
         emb = Embedder(bb, log=log, **embedder_kw)
         if input == "spikes":
             emb.fit_spikes(data)
+        elif input == "coco_mask":
+            emb.fit_coco_masks(data, resize=mask_resize, channel_key=mask_channel_key, fps=fs)
         elif input == "fiber_photometry":
             emb.fit_fiber(data, time_axis=time_axis, fs=fs, dff=dff)
         else:
