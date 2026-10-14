@@ -47,6 +47,7 @@ class TCNVariantConfig:
     stochastic_dense_z: bool = True
     stochastic_dynamic_prior: bool = True
     stochastic_precision_update: bool = True
+    stochastic_eval_posterior: bool = True
     pit_l1: float = 1e-5
     pit_threshold: float = 0.5
     attention_heads: int = 4
@@ -702,7 +703,11 @@ class StochasticTCN(TCNModelBase):
             else:
                 q_mu, q_logvar = q_mu_raw, q_logvar_raw
 
-            use_posterior = self.training
+            # Training samples the posterior (ELBO). At inference the embedding
+            # reads the posterior mean by default (the representation of the
+            # observed data, as in a VAE encoder); set
+            # stochastic_eval_posterior=False to read the prior mean instead.
+            use_posterior = self.training or self.cfg.stochastic_eval_posterior
             sample_mu, sample_logvar = (q_mu, q_logvar) if use_posterior else (p_mu, p_logvar)
             z = self._sample(sample_mu, sample_logvar, self.training)
 

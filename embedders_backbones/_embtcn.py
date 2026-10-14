@@ -210,15 +210,18 @@ class NeuralEmbTCN(nn.Module):
 
 def make_span_mask(batch: int, length: int, ratio: float, span: int,
                    device=None, generator=None) -> torch.Tensor:
-    """Boolean [B, T] mask of contiguous spans covering ~ratio of frames."""
-    mask = torch.zeros(batch, length, dtype=torch.bool, device=device)
-    span = max(int(span), 1)
+    """Boolean [B, T] mask of contiguous spans covering ~ratio of frames.
+
+    Vectorised: all span starts are drawn in one call and scattered at once
+    (the v0.1 version drew one random number per span in a Python loop).
+    Spans may overlap, so the realised ratio is slightly below ``ratio``."""
+    span = max(1, min(int(span), int(length)))
     n_spans = max(int(round(ratio * length / span)), 1)
-    for b in range(batch):
-        for _ in range(n_spans):
-            start = int(torch.randint(0, max(length - span, 1), (1,), generator=generator))
-            mask[b, start: start + span] = True
-    return mask
+    starts = torch.randint(0, length - span + 1, (batch, n_spans), generator=generator)
+    idx = (starts[..., None] + torch.arange(span)).reshape(batch, -1)
+    mask = torch.zeros(batch, length, dtype=torch.bool)
+    mask.scatter_(1, idx, True)
+    return mask.to(device) if device is not None else mask
 
 
 def masked_reconstruction_loss(x: torch.Tensor, x_hat: torch.Tensor,

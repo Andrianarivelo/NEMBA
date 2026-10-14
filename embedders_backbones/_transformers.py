@@ -478,12 +478,16 @@ class _AxialBlock(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:   # h [B,N,T,d]
         B, N, T, d = h.shape
+        # need_weights=False lets PyTorch use the fused (flash / memory-efficient)
+        # attention kernel; the norm is computed once instead of three times.
         ht = h.reshape(B * N, T, d)
-        a, _ = self.t_attn(self.t_norm(ht), self.t_norm(ht), self.t_norm(ht))
+        hn = self.t_norm(ht)
+        a, _ = self.t_attn(hn, hn, hn, need_weights=False)
         ht = ht + a
         h = ht.reshape(B, N, T, d)
         hs = h.permute(0, 2, 1, 3).reshape(B * T, N, d)
-        a, _ = self.s_attn(self.s_norm(hs), self.s_norm(hs), self.s_norm(hs))
+        hn = self.s_norm(hs)
+        a, _ = self.s_attn(hn, hn, hn, need_weights=False)
         hs = hs + a
         h = hs.reshape(B, T, N, d).permute(0, 2, 1, 3)
         h = h + self.ffn(self.f_norm(h))
@@ -685,13 +689,13 @@ class _GraphBlock(nn.Module):
         # spatial: attend over neurons, restricted to graph edges
         hs = h.permute(0, 2, 1, 3).reshape(B * T, N, d)
         hn = self.g_norm(hs)
-        a, _ = self.g_attn(hn, hn, hn, attn_mask=attn_mask)
+        a, _ = self.g_attn(hn, hn, hn, attn_mask=attn_mask, need_weights=False)
         hs = hs + a
         h = hs.reshape(B, T, N, d).permute(0, 2, 1, 3)
         # temporal: attend over time per neuron
         ht = h.reshape(B * N, T, d)
         hn = self.t_norm(ht)
-        a, _ = self.t_attn(hn, hn, hn)
+        a, _ = self.t_attn(hn, hn, hn, need_weights=False)
         ht = ht + a
         h = ht.reshape(B, N, T, d)
         h = h + self.ffn(self.f_norm(h))
@@ -833,6 +837,43 @@ class LinearChainCRF(nn.Module):
     def nll(self, z: torch.Tensor, tags: torch.Tensor) -> torch.Tensor:
         emissions = self.emit(z)                        # [T,K]
         return self._log_partition(emissions) - self._scores(emissions, tags)
+
+    def nll_batch(self, z: torch.Tensor, tags: torch.Tensor) -> torch.Tensor:
+        """Mean negative log-likelihood of n chunks: z [n, L, E], tags [n, L].
+
+        Vectorised over chunks: one forward recursion of length L instead of a
+        Python loop over the full recording."""
+        em = self.emit(z)                                   # [n, L, K]
+        n, L, _ = em.shape
+        gold = em.gather(2, tags.unsqueeze(-1)).squeeze(-1).sum(1)
+        gold = gold + self.start[tags[:, 0]] + self.end[tags[:, -1]]
+        if L > 1:
+            gold = gold + self.trans[tags[:, :-1], tags[:, 1:]].sum(1)
+        alpha = self.start.unsqueeze(0) + em[:, 0]          # [n, K]
+        for t in range(1, L):
+            alpha = torch.logsumexp(alpha.unsqueeze(2) + self.trans.unsqueeze(0)
+                                    + em[:, t].unsqueeze(1), dim=1)
+        log_z = torch.logsumexp(alpha + self.end.unsqueeze(0), dim=1)
+        return (log_z - gold).mean()
+
+    @torch.no_grad()
+    def viterbi_np(self, z: np.ndarray) -> np.ndarray:
+        """Viterbi decoding of the full sequence z [T, E] in NumPy."""
+        em = self.emit(torch.as_tensor(z, dtype=torch.float32)).numpy()
+        trans = self.trans.detach().numpy()
+        T, K = em.shape
+        score = self.start.detach().numpy() + em[0]
+        back = np.zeros((T, K), dtype=np.int64)
+        for t in range(1, T):
+            m = score[:, None] + trans
+            back[t] = m.argmax(0)
+            score = m.max(0) + em[t]
+        score = score + self.end.detach().numpy()
+        path = np.empty(T, dtype=np.int64)
+        path[-1] = int(score.argmax())
+        for t in range(T - 1, 0, -1):
+            path[t - 1] = back[t, path[t]]
+        return path
 
     @torch.no_grad()
     def viterbi(self, z: torch.Tensor) -> np.ndarray:

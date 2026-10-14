@@ -8,7 +8,8 @@ __pycache__/
 venv/
 env/
 
-.vscode/
+.vscode/*
+!.vscode/launch.json
 .idea/
 
 *.egg-info/
@@ -28,3 +29,19 @@ out/
 *.pdf
 *.csv
 *.json
+
+# session memory (local only)
+PROJECT_MEMORY.md
+
+# benchmark smoke-test output and run outputs
+benchmarks/results_quick/
+embedder_out/
+
+# keep benchmark results (csv/json/figures) under version control
+!benchmarks/results/
+!benchmarks/results/**
+!.vscode/launch.json
+
+# README images
+!docs/images/
+!docs/images/**

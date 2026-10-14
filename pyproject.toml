@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embedders_backbones"
-version = "0.1.0"
-description = "Standalone self-supervised sequence encoders (Transformer-AE+DEC, TST, Bi-LSTM, Spatiotemporal, Graph-Attn, ...) for any population time series, with embedding visualisation."
+version = "0.2.0"
+description = "NEMBA: CPU-first self-supervised sequence encoders for population time series, with time-series-aware decoding and visualisation."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["numpy", "scipy", "scikit-learn", "matplotlib", "pandas", "pillow", "torch>=2.0"]
@@ -13,9 +13,14 @@ dependencies = ["numpy", "scipy", "scikit-learn", "matplotlib", "pandas", "pillo
 [project.optional-dependencies]
 full = ["umap-learn", "ripser", "persim"]
 coco = ["pycocotools"]
+test = ["pytest"]
 
 [project.scripts]
+nemba = "main:main"
 embedders-backbones = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 include = ["embedders_backbones*"]
