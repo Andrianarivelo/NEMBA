@@ -1,0 +1,40 @@
+{
+  "BACKBONES": [
+    "pca",
+    "tcn",
+    "embtcn",
+    "c2f_tcn",
+    "tst",
+    "bilstm",
+    "dtc"
+  ],
+  "SEEDS": [
+    0,
+    1,
+    2
+  ],
+  "N_NEURONS": 60,
+  "DURATION_S": 600.0,
+  "DT": 0.1,
+  "EPOCHS_V01": 80,
+  "V02_CONFIGS": {
+    "v0.2-fast": {
+      "speed": "fast"
+    },
+    "v0.2-fast-contrastive": {
+      "speed": "fast",
+      "objective": "contrastive"
+    },
+    "v0.2-fast-hybrid": {
+      "speed": "fast",
+      "objective": "hybrid"
+    },
+    "v0.2-balanced": {
+      "speed": "balanced"
+    }
+  },
+  "DECODE_MODEL": "linear",
+  "N_FOLDS": 5,
+  "K_TRUE": 3,
+  "BOOT": 5000
+}

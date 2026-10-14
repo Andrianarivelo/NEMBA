@@ -254,7 +254,7 @@ def make_figures(df, stats_df, outdir):
             fig.savefig(os.path.join(outdir, f"benchmark_per_backbone.{f}"), dpi=300, bbox_inches="tight")
 
         # paired differences with test annotations
-        fig = Figure(figsize=(FIG_W, 2.6), layout="constrained")
+        fig = Figure(figsize=(FIG_W * 1.45, 3.0), layout="constrained")
         comps = sorted(stats_df.comparison.unique())
         axes = fig.subplots(1, len(metrics))
         for ax, (m, lab) in zip(axes, metrics):
@@ -266,13 +266,14 @@ def make_figures(df, stats_df, outdir):
                 col = pal[c.split(" - ")[0]]
                 ax.errorbar(j, r.mean_diff, yerr=[[r.mean_diff - r.ci95_low], [r.ci95_high - r.mean_diff]],
                             fmt="o", ms=4, color=col, elinewidth=1.0, capsize=2)
-                ax.text(j, r.ci95_high, f"\np={r.p_holm:.2g}" if r.p_holm >= 0.001 else "\np<0.001",
-                        ha="center", va="bottom", fontsize=FONT - 1.5)
+                ax.text(j, r.ci95_high, (f" p={r.p_holm:.2g}" if r.p_holm >= 0.001 else " p<0.001"),
+                        ha="center", va="bottom", fontsize=FONT - 2, rotation=90)
             ax.axhline(0, color="#8a8984", lw=0.6)
             ax.set_xticks(range(len(comps))); ax.set_xticklabels([SHORT.get(c.split(" - ")[0], c) for c in comps],
                                rotation=45, ha="right")
-            ttl = lab.replace("\n", " ")
-            ax.set_title(("log10 time ratio" if m == "fit_seconds" else ttl), fontsize=FONT)
+            ax.set_title(("log10 time ratio\n(v0.2 / v0.1)" if m == "fit_seconds" else lab),
+                         fontsize=FONT)
+            ax.margins(y=0.3)
             ax.margins(x=0.4)
         fig.suptitle("paired difference v0.2 - v0.1 (mean, 95% bootstrap CI, Holm p)", fontsize=FONT + 1)
         for f in FIG_FORMATS:

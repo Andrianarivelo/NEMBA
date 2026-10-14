@@ -79,7 +79,7 @@ def configure_threads(n_threads=None):
         pass
 
 
-def resolve_settings(speed="balanced", **user):
+def resolve_settings(speed="fast", **user):
     """Merge a speed preset with explicit user values (``None`` = use preset)."""
     if speed not in SPEED_PRESETS:
         raise ValueError(f"speed must be one of {list(SPEED_PRESETS)}, got {speed!r}")
@@ -204,7 +204,7 @@ def _val_batches(Xt, seg, L, max_windows=64):
 # training                                                                     #
 # --------------------------------------------------------------------------- #
 
-def train(name, X, *, embedding_dim=32, speed="balanced", max_steps=None, epochs=None,
+def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=None,
           win_len=None, batch=None, stride=None, lr=1e-3, weight_decay=1e-4,
           mask_ratio=0.4, mask_span=16, objective="masked", contrastive_weight=0.5,
           temperature=0.2, contrastive_offset=10, n_pairs=8, val_frac=0.1,

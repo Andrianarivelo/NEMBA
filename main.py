@@ -48,7 +48,7 @@ def build_parser():
                    help="COCO annotation key for separate mask channels, e.g. track_id")
     g = ap.add_argument_group("model")
     g.add_argument("--backbone", default="tcn")
-    g.add_argument("--speed", default="balanced", choices=["fast", "balanced", "accurate"],
+    g.add_argument("--speed", default="fast", choices=["fast", "balanced", "accurate"],
                    help="CPU budget preset (steps, window, width, time cap)")
     g.add_argument("--objective", default="masked", choices=["masked", "contrastive", "hybrid"])
     g.add_argument("--max-steps", type=int, default=None, help="override the preset step budget")

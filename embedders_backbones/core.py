@@ -40,7 +40,7 @@ class Embedder:
     """
 
     def __init__(self, backbone="dtc", *, bin_size=0.2, embedding_dim=32, n_states=None,
-                 k_min=2, k_max=10, speed="balanced", max_steps=None, epochs=None,
+                 k_min=2, k_max=10, speed="fast", max_steps=None, epochs=None,
                  win_len=None, stride=None, batch=None, objective="masked",
                  contrastive_weight=0.5, temperature=0.2, contrastive_offset=10,
                  mask_ratio=0.4, mask_span=16, val_frac=0.1, lr=1e-3,

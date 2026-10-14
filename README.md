@@ -182,8 +182,8 @@ Tip: the smallest possible p is 1/(n_perm + 1) before correction, so use
 
 | preset | steps | window | width | time cap | for |
 |---|---|---|---|---|---|
-| `fast` | 300 | 128 | 0.5x | 90 s | exploring, comparing, laptops |
-| `balanced` (default) | 1000 | 256 | 1x | 600 s | final embeddings |
+| `fast` (default) | 300 | 128 | 0.5x | 90 s | almost everything (as good as `balanced` in the benchmark) |
+| `balanced` | 1000 | 256 | 1x | 600 s | long or rich recordings, check against `fast` |
 | `accurate` | 4000 | 256 | 1x | none | long, fully reproducible runs |
 
 Training stops early when the held-out loss stops improving and keeps the best
@@ -242,6 +242,40 @@ Results, statistics (CSV) and figures land in
 ```bash
 python benchmarks/benchmark_v01_vs_v02.py --old <path to a v0.1 checkout>
 ```
+
+**Results** (60 neurons x 6,000 bins, 3 recordings, 6 trained backbones; laptop CPU, no GPU):
+
+![per backbone](benchmarks/results/benchmark_per_backbone.png)
+![paired differences](benchmarks/results/benchmark_paired_differences.png)
+
+| v0.2 vs v0.1 (18 paired fits) | fit time | phase | speed R² | state acc. | state ARI |
+|---|---|---|---|---|---|
+| `fast` (masked, leak-free) | same (x1.03, n.s.) | = | = | -0.005 (p=0.02, tiny) | = |
+| `fast` + contrastive | = | -0.026 | **-0.091** | **-0.050** | = |
+| `fast` + hybrid | = | = | **-0.078** | **-0.044** | = |
+| `balanced` (9 fits) | **x4.3 slower** | = | = | = | = |
+
+What it means, without spin:
+
+* **Fixing the masking leak cost nothing on average**, and v0.2 adds decoding,
+  baselines and visuals at the same CPU time as v0.1.
+* **`balanced` bought nothing for 4.3x the time** on this recording size, so
+  `fast` is now the default. (Longer or richer recordings may still benefit
+  from `balanced`; measure on your data.)
+* **Time-contrastive training lost information** about fast variables (speed)
+  and states here: it favours slow features. It stays available, not default.
+* **The untrained PCA baseline decoded best of all** (speed R² 0.84 vs 0.82 for
+  the best trained model), yet its states are unrecognisable (ARI 0.01 vs about
+  0.3 to 0.5 for trained models). Deep embeddings did not add *linearly
+  decodable* information here; they reshaped the geometry so that behavioural
+  states became clusterable. Which one you need depends on your question.
+* State recovery (ARI) varies hugely between runs of the same model: never
+  trust one run's states.
+
+Full tables: `benchmark_paired_stats.csv` (normality check, test used, CIs,
+effect sizes, Holm p), `benchmark_summary.csv`, `benchmark_raw.csv`.
+Where to go next (Poisson objectives, neuron masking, co-smoothing, HMM states,
+CEBRA, Rastermap, ...): [`docs/EMBEDDERS_REVIEW.md`](docs/EMBEDDERS_REVIEW.md).
 
 ---
 
