@@ -6,16 +6,24 @@ Usage
     python -m embedders_backbones.gui
 
     Sidebar (left, top to bottom)
-      Data       recording file (empty = synthetic demo) and how to read it
-      Behaviour  optional variables to decode and colour by (.csv / .npz / .npy)
-      Model      backbone, speed preset, objective, states, step budget
+      Data       recording file (empty = synthetic demo), how to read it
+                 ('auto' recognises spike times, COCO json, DeepLabCut CSV,
+                 tables) and the data advisor (goal + "Analyse data")
+      Behaviour  optional variables to decode and colour by (.csv / .npz / .npy),
+                 decoder, PSID rows, co-smoothing score
+      Model      backbone, speed preset, objective, likelihood, masking,
+                 states and state model, embedding size, step budget
       Output     folder for figures (png/pdf/svg), CSV tables, GIF, HTML explorer
       Compare    comma list of backbones fitted side by side
     Run (Ctrl+R / F5) fits one backbone, Compare fits the list, Stop (Esc)
-    cancels at the next validation check of the training loop.
+    cancels at the next validation check of the training loop. "Analyse
+    data" profiles the recording and fills the Advisor tab; "Apply
+    suggestions" copies the advice into the sidebar, "Run suggested" also runs.
 
-    Tabs (right): Overview (dashboard), Embedding (2-D map, re-colourable),
-    Decoding (held-out scores + table), Training (loss curves), Compare, Log.
+    Tabs (right): Advisor (data profile + advice), Overview (dashboard),
+    Embedding (2-D map, re-colourable), Decoding (held-out scores + table),
+    Dynamics (topology, flow field, recurrence, raster, state contingency),
+    Training (loss curves), Compare (grid or consistency matrix), Log.
 
 Threading design
 ----------------
@@ -44,12 +52,16 @@ The last used field values are remembered in ``~/.nemba_gui.json``.
 
 from __future__ import annotations
 
+import copy
 import gc
+import importlib
+import importlib.util
 import json
 import os
 import queue
 import re
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -75,7 +87,8 @@ from . import viz
 from .core import Embedder
 from .compare import compare_embedders
 from .backbones import list_backbones, label, CPU_COST_HINT
-from .training import SPEED_PRESETS, OBJECTIVES
+from .training import SPEED_PRESETS, OBJECTIVES, MASK_MODES
+from .decoding import infer_task
 from .synthetic import make_dataset, demo_spikes
 
 try:                                           # version string for the header
@@ -114,38 +127,69 @@ MONO_FAMILY = "Consolas"
 BODY_PT, TITLE_PT, SMALL_PT, BRAND_PT, MONO_PT = 9, 10, 8, 15, 9
 
 SIDEBAR_W = 340              # logical px (scaled with the screen DPI)
-LABEL_COL_W = 84             # width of the label column in the sidebar cards
+LABEL_COL_W = 93             # width of the label column (fits 'Embedding dim' + padding)
 WINDOW_SIZE = (1380, 860)
 MIN_SIZE = (1080, 680)
 POLL_MS = 60                 # queue drain period of the main thread
 MAX_LOG_LINES = 6000
 # largest up-scaling of a figure above its native size (keeps fonts in proportion)
-SCALE_CAP = dict(overview=1.35, embedding=1.45, decoding=1.6, training=1.9, compare=1.6)
+SCALE_CAP = dict(overview=1.35, embedding=1.45, decoding=1.6, training=1.9, compare=1.6,
+                 advisor=1.45, dynamics=1.6)
 EMBED_FIGSIZE = (6.2, 4.5)   # inches of the Embedding-tab scatter
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".nemba_gui.json")
-INPUT_TYPES = ["spikes", "pose", "mask", "coco_mask", "fiber_photometry", "timeseries"]
+INPUT_TYPES = ["auto", "spikes", "pose", "mask", "coco_mask", "fiber_photometry", "timeseries"]
 TIME_AXES = ["1 - channels x time", "0 - time x channels"]
-PROJECTIONS = ["umap", "pca", "tsne"]
-PRETTY = {"umap": "UMAP", "pca": "PCA", "tsne": "t-SNE"}
+PROJECTIONS = ["umap", "pca", "tsne", "tphate"]
+PRETTY = {"umap": "UMAP", "pca": "PCA", "tsne": "t-SNE", "tphate": "T-PHATE"}
 SPEEDS = list(SPEED_PRESETS)
+GOALS = ["auto", "decode", "states", "visualize"]          # advisor goals
+LIKELIHOODS = ["gaussian", "poisson", "auto"]              # Embedder(likelihood=)
+MASK_CHOICES = list(MASK_MODES)                            # Embedder(mask_mode=)
+STATE_MODELS = ["auto", "kmeans", "hmm", "arhmm"]          # hmm / arhmm need .states
+EMB_DIMS = ["auto", "2", "3", "4", "8", "12", "16", "32", "64"]
+DECODERS = ["linear", "knn", "gbm", "logistic"]            # Embedder.decode(model=)
 DEFAULT_COMPARE = "pca,tcn,tst,bilstm"
 DEFAULTS = dict(
-    file="", input_type="spikes", time_axis=TIME_AXES[0], bin_size="0.2", fs="", dff=False,
-    mask_size="64", mask_key="", beh_file="", circular="", n_perm="200",
-    backbone="tcn", speed="fast", objective="masked", n_states="auto", max_steps="",
+    file="", input_type="auto", time_axis=TIME_AXES[0], bin_size="0.2", fs="", dff=False,
+    mask_size="64", mask_key="", beh_file="", circular="", n_perm="200", decoder="linear",
+    psid=False, cosmooth=False, goal="auto",
+    backbone="tcn", speed="fast", objective="masked", likelihood="gaussian", mask_mode="time",
+    n_states="auto", state_model="auto", emb_dim="auto", max_steps="",
     smooth="4.0", outdir=os.path.join(os.getcwd(), "embedder_out"), gif=True, html=True,
     gif_method="umap", compare=DEFAULT_COMPARE,
 )
 # CPU cost hint -> (text, palette colour)
 COST_TEXT = {"instant": ("instant, no training", "ok"), "fast": ("fast on CPU", "ok"),
              "medium": ("medium cost on CPU", "warn"),
-             "slow": ("slow on CPU, prefer speed Fast", "bad")}
+             "slow": ("slow on CPU, prefer speed Fast", "bad"),
+             "missing": ("requires cebra (pip install cebra)", "bad")}
 DEMO_HINT = "Empty = synthetic demo with behaviour."
 # which optional Data rows each input type needs (others are hidden)
-DATA_ROWS = {"spikes": ("bin",), "pose": ("axis",), "timeseries": ("axis",),
+DATA_ROWS = {"auto": ("bin",), "spikes": ("bin",), "pose": ("axis",), "timeseries": ("axis",),
              "mask": ("axis",), "coco_mask": ("mask", "mask_key", "fs"),
              "fiber_photometry": ("axis", "fs", "dff")}
+# advisor fit method -> explicit input type (used by "Apply suggestions")
+FIT_TO_INPUT = {"fit_spikes": "spikes", "fit_fiber": "fiber_photometry",
+                "fit_coco_masks": "coco_mask", "fit_features": "timeseries"}
+# Dynamics tab: how to read each figure (shown next to its statistics)
+DYN_HELP = {
+    "topology": "Persistent homology of the latent cloud (bars divided by its diameter). One "
+                "long H1 bar well above the Gaussian null suggests a ring; two long H1 bars and "
+                "one H2 bar a torus. Long bars can also come from unvisited gaps.",
+    "flow": "Mean latent velocity per cell of the 2-D projection. Coherence near 1: every "
+            "passage moves the same way; near 0: crossing or diffusive motion. In UMAP, t-SNE "
+            "or T-PHATE space read directions, not speeds.",
+    "recurrence": "Similarity of the latent state between all pairs of frames. Off-diagonal "
+                  "stripes: returns to earlier states; checkerboard: discrete states; broad "
+                  "diagonal band: slow drift. tau 1e is the lag where similarity drops to 1/e.",
+    "rastermap": "Neurons sorted by activity similarity (Rastermap when installed, else the "
+                 "PC1-PC2 angle), with the state raster and the first behaviour on the same "
+                 "time axis.",
+    "contingency": "P(label | state) after Hungarian matching. ARI is tested against a "
+                   "circular-shift null (both sequences are autocorrelated); homogeneity: each "
+                   "state holds one label; completeness: each label sits in one state.",
+}
 
 _FIT_RE = re.compile(r"^=+\s*fitting\s+(\S+)\s*=+$")
 
@@ -176,6 +220,9 @@ class _RunResult:
     figures: dict = field(default_factory=dict)
     metrics: dict = field(default_factory=dict)
     view: tuple = ("umap", "time")           # (projection, colour key) of the embedding figure
+    gif_method: str = "umap"                 # projection used by the flow field (as in the files)
+    decoder: str = "linear"
+    cosmooth: dict | None = None             # emb.cosmooth() result (bits / spike), if computed
 
 
 @dataclass
@@ -185,6 +232,19 @@ class _CompareResult:
     outdir: str
     figure: Figure
     view: tuple = ("umap", "state")
+    consistency: object = None               # DataFrame (row predicts column) or None
+    cons_figure: Figure | None = None
+
+
+@dataclass
+class _AdviceResult:
+    """Everything a finished advisor job hands to the main thread."""
+    rec: object                              # advisor.Recommendation
+    figure: Figure                           # profile_figure(rec.profile)
+    report: str                              # rec.report() (markdown)
+    key: tuple                               # (file, input type) the advice belongs to
+    name: str                                # data name for captions
+    outdir: str
 
 
 def _fmt(v):
@@ -273,6 +333,85 @@ def _embedding_figure(emb, method, color_key, behaviour, circular):
                                 seed=emb.seed, projections=proj, times=emb.times,
                                 behavior=beh, behavior_name=name, circular=circ,
                                 title=f"{label(emb.backbone)} embedding", fig=fig)
+
+
+FIGURE_FEATURES = ("embedding", "raw_pca")   # decoding rows viz.decoding_figure labels right
+FEATURE_NAMES = {"embedding": "embedding", "raw_pca": "raw PCA", "psid": "PSID",
+                 "bayes_counts": "Bayes (counts)"}
+
+
+def _decoding_view(result):
+    """Decoding result to draw with ``viz.decoding_figure``.
+
+    ``decoding_figure`` labels every non-embedding row 'raw PCA', so reference
+    rows such as PSID ('psid') or the Bayesian count decoder ('bayes_counts')
+    would be mislabelled: the figure gets only ``FIGURE_FEATURES`` rows
+    (shallow copy; the table in the GUI still lists every row)."""
+    tab = getattr(result, "table", None)
+    if tab is None or "features" not in tab or tab["features"].isin(FIGURE_FEATURES).all():
+        return result
+    view = copy.copy(result)
+    view.table = tab[tab["features"].isin(FIGURE_FEATURES)].reset_index(drop=True)
+    return view
+
+
+def _dynamics_choices(emb, behaviour, circular):
+    """Dynamics figures available for ``emb``: display name -> (kind, behaviour name).
+
+    Mirrors ``Embedder.write_dynamics``: the raster needs >= 8 input channels,
+    one contingency table per discrete (classification) behaviour."""
+    out = {"Topology": ("topology", None), "Flow field": ("flow", None),
+           "Recurrence": ("recurrence", None)}
+    if emb.X_input is not None and emb.X_input.shape[0] >= 8:
+        out["Rastermap"] = ("rastermap", None)
+    for name, v in (behaviour or {}).items():
+        if name not in (circular or ()) and infer_task(np.asarray(v)) == "classification":
+            out[f"Contingency {name}"] = ("contingency", name)
+    return out
+
+
+def _dynamics_figure(emb, kind, beh_name, behaviour, circular, method):
+    """Build one Dynamics figure (worker-safe) with the arguments of
+    ``Embedder.write_dynamics``. Returns (figure, [(statistic, value)], caption)."""
+    from . import viz_dynamics as VD
+    circular = tuple(circular or ())
+    if kind == "topology":
+        fig = VD.persistence_figure(emb.Z, seed=emb.seed)
+        cap = "Vietoris-Rips persistence (ripser) of a random subset of frames"
+    elif kind == "flow":
+        fig = VD.flow_field_figure(*emb.projection(method), dt=emb.frame_dt(), states=emb.states)
+        cap = f"flow in {PRETTY.get(method, method)} space (projection of the run)"
+    elif kind == "recurrence":
+        fig = VD.recurrence_figure(emb.Z, times=emb.times)
+        cap = "cosine similarity between strided frames"
+    elif kind == "rastermap":
+        first = next(iter((behaviour or {}).items()), (None, None))
+        fig = VD.rastermap_figure(emb.X_input, times=emb.times, states=emb.states,
+                                  behavior=first[1], behavior_name=first[0] or "behaviour",
+                                  circular=first[0] in circular, seed=emb.seed)
+        cap = f"{emb.X_input.shape[0]} input channels, sorted by {fig.nemba_sort_method}"
+    elif kind == "contingency":
+        fig = VD.contingency_figure(emb.states, behaviour[beh_name], label_name=beh_name,
+                                    seed=emb.seed)
+        cap = f"discovered states vs '{beh_name}'"
+    else:
+        raise ValueError(f"unknown dynamics figure {kind!r}")
+    rows = _scalar_stats(getattr(fig, "nemba_stats", None))
+    if kind == "rastermap":                     # the raster carries an order, not statistics
+        rows = [("sort method", fig.nemba_sort_method),
+                ("neurons", int(emb.X_input.shape[0])), ("frames", int(emb.X_input.shape[1]))]
+    return fig, rows, cap
+
+
+def _scalar_stats(stats):
+    """Scalar entries of a ``fig.nemba_stats`` dict as (readable name, value) rows.
+
+    Arrays, tables and lists are skipped (they are in the CSV files)."""
+    rows = []
+    for k, v in (stats or {}).items():
+        if isinstance(v, (bool, np.bool_)) or (np.isscalar(v) and not isinstance(v, (str, bytes))):
+            rows.append((str(k).replace("_", " "), v))
+    return rows
 
 
 class _Reporter:
@@ -497,8 +636,23 @@ class FigurePane(ttk.Frame):
         """Display ``fig`` (replacing the previous one) and its toolbar."""
         self._destroy_canvas()
         self.figure = fig
-        size_in = np.asarray(fig.get_size_inches(), float)
-        self._native_px = size_in * float(fig.dpi) * self.app.dpr      # physical pixels
+        # Cached figures (Dynamics, Compare toggle) can be shown again. Their Tk
+        # canvas scaled the dpi by the device pixel ratio and resized the inches,
+        # and re-pointing the canvas makes matplotlib take the SCALED dpi as the
+        # new "original" one, so a second canvas would scale it twice (text 1.75x
+        # too large on a 168-dpi screen). The native dpi and size are therefore
+        # remembered on the first show and restored on every later one.
+        dpi0 = getattr(fig, "_nemba_dpi0", None)
+        if dpi0 is None:
+            dpi0 = float(getattr(fig, "_original_dpi", fig.dpi))
+            fig._nemba_dpi0 = dpi0
+            fig._nemba_size0 = tuple(float(v) for v in fig.get_size_inches())
+        else:
+            fig._original_dpi = dpi0
+            fig.set_dpi(dpi0)
+            fig.set_size_inches(fig._nemba_size0, forward=False)
+        size_in = np.asarray(fig._nemba_size0, float)
+        self._native_px = size_in * dpi0 * self.app.dpr                # physical pixels
         self._placed, self._rounds = None, 0
         self.canvas = FigureCanvasTkAgg(fig, master=self.stage)
         self.canvas.mpl_connect("draw_event", self._on_draw)
@@ -520,6 +674,17 @@ class FigurePane(ttk.Frame):
             self.placeholder.configure(text=text)
         self.caption_lbl.configure(text=caption)
         self.placeholder.place(relx=0.5, rely=0.45, anchor="center")
+
+    def destroy(self):
+        """Cancel the pending debounced layout before the widget goes away
+        (else Tk reports 'invalid command name ..._layout_now')."""
+        if self._after is not None:
+            try:
+                self.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+        super().destroy()
 
     # ----- internals -------------------------------------------------------- #
     def _destroy_canvas(self):
@@ -606,6 +771,217 @@ class FigurePane(ttk.Frame):
         self.after_idle(lambda: self.canvas.draw() if self.canvas is not None else None)
 
 
+class ReportView(ttk.Frame):
+    """Read-only rich-text view of a markdown report (the advisor's advice).
+
+    Renders what ``advisor.Recommendation.report()`` emits: '#' / '##'
+    headings, '* ' bullets, '|' tables (monospace, every cell wrapped to the
+    view width so nothing is clipped), fenced code blocks, inline **bold** and
+    `code`, and an italic closing note. Bullets under a 'Warnings' heading use
+    the warning colour. The text is re-flowed (debounced) when the width of
+    the view changes, because table columns depend on it."""
+
+    INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`)")
+
+    def __init__(self, master, app, placeholder=""):
+        """Build the text widget, its scrollbar and the formatting tags."""
+        super().__init__(master, style="Panel.TFrame")
+        self.app = app
+        px, P = app.px, PALETTE
+        self._md = ""
+        self._cols = None                     # characters per line of the last rendering
+        self._after = None
+        self.text = tk.Text(self, font=app.f_body, bg=P["panel"], fg=P["text"], relief="flat",
+                            bd=0, wrap="word", padx=px(18), pady=px(8), highlightthickness=0,
+                            selectbackground=P["accent_soft"], selectforeground=P["text"],
+                            insertbackground=P["panel"], cursor="arrow", spacing1=px(1),
+                            spacing3=px(1), width=40, height=6, state="disabled")
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.text.yview,
+                            style="Slim.Vertical.TScrollbar")
+        self.text.configure(yscrollcommand=App._autohide(vsb))
+        self.text.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        fam = app.f_body.actual("family")
+        self._fonts = dict(h1=tkfont.Font(self, family=fam, size=TITLE_PT + 3, weight="bold"),
+                           italic=tkfont.Font(self, family=fam, size=BODY_PT, slant="italic"),
+                           gap=tkfont.Font(self, family=fam, size=4))
+        t, ind = self.text, px(6)
+        t.tag_configure("h1", font=self._fonts["h1"], spacing1=px(2), spacing3=px(4))
+        t.tag_configure("h2", font=app.f_title, foreground=P["accent"], spacing1=px(10),
+                        spacing3=px(4))
+        t.tag_configure("bullet", lmargin1=ind, lmargin2=px(20))
+        t.tag_configure("para", lmargin1=ind, lmargin2=ind)
+        t.tag_configure("note", font=self._fonts["italic"], foreground=P["muted"],
+                        lmargin1=ind, lmargin2=ind, spacing1=px(6))
+        t.tag_configure("code", font=app.f_mono, background=P["heading"], lmargin1=px(10),
+                        lmargin2=px(22), rmargin=px(10), wrap="char")
+        t.tag_configure("th", font=app.f_mono_bold, wrap="none", lmargin1=ind, lmargin2=ind)
+        t.tag_configure("td", font=app.f_mono, wrap="none", lmargin1=ind, lmargin2=ind)
+        t.tag_configure("rule", font=app.f_mono, foreground=P["field"], wrap="none",
+                        lmargin1=ind)
+        t.tag_configure("gap", font=self._fonts["gap"])
+        t.tag_configure("placeholder", foreground=P["muted"], justify="center", spacing1=px(40))
+        # colour and inline-font tags are created last: when several tags set the
+        # same option, the most recently created tag wins
+        t.tag_configure("warn", foreground=P["warn"])
+        t.tag_configure("bold", font=app.f_bold)
+        t.tag_configure("icode", font=app.f_mono, background=P["heading"])
+        self.text.bind("<Configure>", self._on_resize)
+        self.clear(placeholder)
+
+    # ----- public ----------------------------------------------------------- #
+    def set_markdown(self, md):
+        """Show ``md`` (markdown text) from the top."""
+        self._md = str(md or "")
+        self._render()
+        self.text.yview_moveto(0)
+
+    def clear(self, text=""):
+        """Show a muted placeholder message instead of a report."""
+        self._md = ""
+        t = self.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", text, ("placeholder",))
+        t.configure(state="disabled")
+
+    def contents(self):
+        """Plain text currently displayed (used by tests)."""
+        return self.text.get("1.0", "end-1c")
+
+    def destroy(self):
+        """Cancel a pending re-flow before the widget goes away."""
+        if self._after is not None:
+            try:
+                self.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+        super().destroy()
+
+    # ----- internals -------------------------------------------------------- #
+    def _chars(self):
+        """Monospace characters that fit on one line of the view."""
+        w = self.text.winfo_width()
+        if w <= 1:
+            w = self.app.px(720)                  # not mapped yet: a typical width
+        usable = w - 2 * int(float(self.text.cget("padx"))) - self.app.px(16)
+        return max(40, int(usable // max(self.app.f_mono.measure("0"), 1)))
+
+    def _on_resize(self, _event=None):
+        """Debounced re-flow when the number of characters per line changes."""
+        if self._after is not None:
+            self.after_cancel(self._after)
+
+        def _redo():
+            """Re-render only if the line width (in characters) really changed."""
+            self._after = None
+            if self._md and self._chars() != self._cols:
+                y = self.text.yview()[0]
+                self._render()
+                self.text.yview_moveto(y)
+        self._after = self.after(120, _redo)
+
+    def _render(self):
+        """Parse the markdown line by line and insert it with tags."""
+        t = self.text
+        self._cols = self._chars()
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        section, in_code, table = "", False, []
+        for line in self._md.splitlines():
+            s = line.rstrip()
+            if s.startswith("```"):                       # fenced code block
+                self._table(table)
+                table = []
+                in_code = not in_code
+                continue
+            if in_code:
+                t.insert("end", s + "\n", ("code",))
+                continue
+            if s.lstrip().startswith("|"):                # table rows are collected first
+                table.append(s)
+                continue
+            if table:
+                self._table(table)
+                table = []
+            warn = section.lower().startswith("warning")
+            if s.startswith("# "):
+                t.insert("end", s[2:].strip() + "\n", ("h1",))
+            elif s.startswith("## "):
+                section = s[3:].strip()
+                tags = ("h2", "warn") if section.lower().startswith("warning") else ("h2",)
+                t.insert("end", section + "\n", tags)
+            elif s.startswith(("* ", "- ")):
+                base = ("bullet", "warn") if warn else ("bullet",)
+                t.insert("end", "•  ", base)
+                self._inline(s[2:], base)
+                t.insert("end", "\n", base)
+            elif len(s) > 2 and s.startswith("_") and s.endswith("_"):
+                t.insert("end", s.strip("_") + "\n", ("note",))
+            elif not s:
+                t.insert("end", "\n", ("gap",))           # thin blank line
+            else:
+                self._inline(s, ("para",))
+                t.insert("end", "\n", ("para",))
+        self._table(table)
+        t.configure(state="disabled")
+
+    def _inline(self, s, base):
+        """Insert ``s`` with **bold** and `code` spans on top of the ``base`` tags."""
+        for part in self.INLINE.split(s):
+            if not part:
+                continue
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                self.text.insert("end", part[2:-2], base + ("bold",))
+            elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+                self.text.insert("end", part[1:-1], base + ("icode",))
+            else:
+                self.text.insert("end", part, base)
+
+    def _table(self, raw):
+        """Render collected '|' rows as an aligned monospace table.
+
+        Column widths start at their natural width; while the table is wider
+        than the view, the widest column loses one character (never below 8).
+        Every cell is then wrapped to its column, so long evidence strings
+        flow over several lines instead of being cut."""
+        rows = []
+        for line in raw:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                continue                                  # the |---|---| separator
+            rows.append([re.sub(r"\*\*|`", "", c) for c in cells])
+        if not rows:
+            return
+        ncol = max(len(r) for r in rows)
+        rows = [r + [""] * (ncol - len(r)) for r in rows]
+        gap = 2
+        avail = max(self._cols - gap * (ncol - 1), 8 * ncol)
+        w = [max(1, max(len(r[j]) for r in rows)) for j in range(ncol)]
+        while sum(w) > avail:
+            j = max(range(ncol), key=lambda c: w[c])
+            if w[j] <= 8:
+                break
+            w[j] -= 1
+        wrapped = [[textwrap.wrap(c, w[j], break_long_words=True, break_on_hyphens=False) or [""]
+                    for j, c in enumerate(r)] for r in rows]
+        multi = any(len(c) > 1 for r in wrapped[1:] for c in r)
+        for i, cells in enumerate(wrapped):
+            tag = ("th",) if i == 0 else ("td",)
+            for k in range(max(len(c) for c in cells)):
+                text = (" " * gap).join((c[k] if k < len(c) else "").ljust(w[j])
+                                        for j, c in enumerate(cells))
+                self.text.insert("end", text.rstrip() + "\n", tag)
+            if i == 0:
+                self.text.insert("end", "─" * (sum(w) + gap * (ncol - 1)) + "\n", ("rule",))
+            elif multi and i < len(wrapped) - 1:
+                self.text.insert("end", "\n", ("gap",))   # separate wrapped rows
+        self.text.insert("end", "\n", ("gap",))
+
+
 # =========================================================================== #
 # the application                                                              #
 # =========================================================================== #
@@ -631,12 +1007,24 @@ class App:
         self._job_kind = None
         self._job_t0 = None
         self._indeterminate = False
-        self._view_busy = {"embedding": False, "compare": False}
-        self._view_pending = {"embedding": None, "compare": None}
+        self._view_busy = {"embedding": False, "compare": False, "dynamics": False}
+        self._view_pending = {"embedding": None, "compare": None, "dynamics": None}
         self.emb = None                 # last fitted Embedder
         self.beh = None                 # its behaviour, aligned on emb.times
         self.circular = []
+        self.run_method = "umap"        # projection of the last run (flow field, files)
+        self.cosmooth = None            # co-smoothing result of the last run (or None)
         self.cmp = None                 # last Comparison
+        self.rec = None                 # last advisor Recommendation
+        self._rec_key = None            # (file, input type) the recommendation belongs to
+        self._dyn_map = {}              # Dynamics choice -> (kind, behaviour name)
+        self._dyn_cache = {}            # Dynamics choice -> (figure, stats rows, caption)
+        self._dyn_shown = None          # Dynamics choice on screen
+        self._cmp_figs = {}             # Compare tab: "grid" / "consistency" -> Figure
+        self._cmp_caption = ""          # caption of the comparison grid
+        self._job_note = ""             # extra text for the "finished" status line
+        self._states_ok_cache = None    # True once embedders_backbones.states imports
+        self._states_error = ""
         self.last_outdir = None
         self.last_status = "idle"
         self.last_elapsed = 0.0
@@ -659,7 +1047,9 @@ class App:
         self._on_data_change()
         self._on_backbone()
         self._on_speed()
+        self._refresh_state_models()
         self._refresh_explorer_button()
+        self._refresh_advice_buttons()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.report_callback_exception = self._report_tk_exception
         self._log(f"NEMBA {_VERSION}  |  {len(list_backbones())} backbones  |  "
@@ -865,13 +1255,21 @@ class App:
         self.var_dff = tk.BooleanVar(value=D["dff"])
         self.var_mask_size = tk.StringVar(value=D["mask_size"])
         self.var_mask_key = tk.StringVar(value=D["mask_key"])
+        self.var_goal = tk.StringVar(value=D["goal"])
         self.var_beh = tk.StringVar(value=D["beh_file"])
         self.var_circ = tk.StringVar(value=D["circular"])
         self.var_nperm = tk.StringVar(value=D["n_perm"])
+        self.var_decoder = tk.StringVar(value=D["decoder"])
+        self.var_psid = tk.BooleanVar(value=D["psid"])
+        self.var_cosmooth = tk.BooleanVar(value=D["cosmooth"])
         self.var_backbone = tk.StringVar(value=self._bb_display.get(D["backbone"], ""))
         self.var_speed = tk.StringVar(value=D["speed"])
         self.var_objective = tk.StringVar(value=D["objective"])
+        self.var_likelihood = tk.StringVar(value=D["likelihood"])
+        self.var_mask_mode = tk.StringVar(value=D["mask_mode"])
         self.var_states = tk.StringVar(value=D["n_states"])
+        self.var_state_model = tk.StringVar(value=D["state_model"])
+        self.var_emb_dim = tk.StringVar(value=D["emb_dim"])
         self.var_max_steps = tk.StringVar(value=D["max_steps"])
         self.var_smooth = tk.StringVar(value=D["smooth"])
         self.var_out = tk.StringVar(value=D["outdir"])
@@ -884,6 +1282,8 @@ class App:
         self.var_view_color = tk.StringVar(value="time")
         self.var_cmp_proj = tk.StringVar(value="umap")
         self.var_cmp_color = tk.StringVar(value="state")
+        self.var_cmp_mode = tk.StringVar(value="grid")       # Compare tab: grid | consistency
+        self.var_dyn_fig = tk.StringVar(value="Topology")    # Dynamics tab figure
         # status bar
         self.var_status = tk.StringVar(value="Ready")
         self.var_elapsed = tk.StringVar(value="")
@@ -892,8 +1292,13 @@ class App:
             "file": self.var_file, "input_type": self.var_type, "time_axis": self.var_taxis,
             "bin_size": self.var_bin, "fs": self.var_fs, "dff": self.var_dff,
             "mask_size": self.var_mask_size, "mask_key": self.var_mask_key,
+            "goal": self.var_goal,
             "beh_file": self.var_beh, "circular": self.var_circ, "n_perm": self.var_nperm,
-            "speed": self.var_speed, "objective": self.var_objective, "n_states": self.var_states,
+            "decoder": self.var_decoder, "psid": self.var_psid, "cosmooth": self.var_cosmooth,
+            "speed": self.var_speed, "objective": self.var_objective,
+            "likelihood": self.var_likelihood, "mask_mode": self.var_mask_mode,
+            "n_states": self.var_states, "state_model": self.var_state_model,
+            "emb_dim": self.var_emb_dim,
             "max_steps": self.var_max_steps, "smooth": self.var_smooth, "outdir": self.var_out,
             "gif": self.var_gif, "html": self.var_html, "gif_method": self.var_gif_method,
             "compare": self.var_compare,
@@ -901,9 +1306,14 @@ class App:
 
     # ------------------------------------------------------------- settings --
     def _apply_settings(self, values):
-        """Load remembered values, ignoring unknown keys and invalid choices."""
+        """Load remembered values, ignoring unknown keys and invalid choices.
+
+        A remembered 'hmm' / 'arhmm' state model is kept only when the
+        temporal state models can be imported (else the default stays)."""
         choices = {"input_type": INPUT_TYPES, "time_axis": TIME_AXES, "speed": SPEEDS,
-                   "objective": list(OBJECTIVES), "gif_method": PROJECTIONS}
+                   "objective": list(OBJECTIVES), "gif_method": PROJECTIONS, "goal": GOALS,
+                   "likelihood": LIKELIHOODS, "mask_mode": MASK_CHOICES,
+                   "state_model": STATE_MODELS, "decoder": DECODERS}
         for key, var in self._persist.items():
             if key not in values:
                 continue
@@ -915,6 +1325,8 @@ class App:
                 elif isinstance(v, (str, int, float)) and not isinstance(v, bool):
                     v = str(v)
                     if key in choices and v not in choices[key]:
+                        continue
+                    if key == "state_model" and v in ("hmm", "arhmm") and not self._states_ok():
                         continue
                     var.set(v)
             except (tk.TclError, ValueError):
@@ -1059,7 +1471,8 @@ class App:
         """Data section: file, input type and the options that type needs.
 
         Optional rows (time axis, bin size, fs, dF/F, mask raster / key) are
-        shown only for the input types that use them (see ``DATA_ROWS``)."""
+        shown only for the input types that use them (see ``DATA_ROWS``).
+        The last row holds the advisor: goal selector and 'Analyse data'."""
         c = self._card(form, "Data")
         e = self._entry(c, self.var_file)
         b = ttk.Button(c, text="Browse", style="Small.TButton", command=self._browse_data)
@@ -1069,8 +1482,11 @@ class App:
         self.hint_file = self._hint(c, 1, DEMO_HINT)
         self.cb_type = self._combo(c, self.var_type, INPUT_TYPES)
         self._row(c, 2, "Input type", self.cb_type, name="input_type",
-                  tip="spikes = list of spike-time arrays; pose / mask / timeseries = matrix; "
-                      "fiber_photometry = signals (optional dF/F); coco_mask = COCO json.")
+                  tip="auto = recognised from the file (spike-time arrays, COCO json, "
+                      "DeepLabCut CSV, tables with a time column, matrices with the time axis "
+                      "detected or taken from the advisor); spikes = list of spike-time arrays; "
+                      "pose / mask / timeseries = matrix; fiber_photometry = signals (optional "
+                      "dF/F); coco_mask = COCO json.")
         self.cb_taxis = self._combo(c, self.var_taxis, TIME_AXES)
         self.en_bin = self._entry(c, self.var_bin)
         self.en_fs = self._entry(c, self.var_fs)
@@ -1100,8 +1516,29 @@ class App:
         Tooltip(self.ck_dff, "Convert raw fluorescence to dF/F (sliding baseline, needs fs).", self)
         self._data_rows["dff"] = ([self.ck_dff], self.ck_dff)
 
+        # data advisor: goal + "Analyse data" share the field and button columns
+        px = self.px
+        box = ttk.Frame(c, style="Panel.TFrame")
+        self.cb_goal = ttk.Combobox(box, textvariable=self.var_goal, values=GOALS, width=8,
+                                    state="readonly")
+        self.cb_goal.pack(side="left", fill="x", expand=True)
+        self.btn_analyse = ttk.Button(box, text="Analyse data", style="Small.TButton",
+                                      command=self.analyse)
+        self.btn_analyse.pack(side="left", padx=(px(6), 0))
+        self._row(c, 9, "Goal", box, name="goal",
+                  tip="What the advisor optimises the suggestions for: auto (decided from the "
+                      "data), decode (behaviour read-out), states (discrete states) or "
+                      "visualize (geometry and trajectories).")
+        self._fields["goal"] = self.cb_goal
+        Tooltip(self.btn_analyse, "Profile the recording (value type, timescales, dimension, "
+                                  "ring / cluster structure, behaviour) and suggest a pipeline "
+                                  "(Advisor tab). Writes advice.md / .json and data_profile "
+                                  "figures to the output folder.", self)
+        self._hint(c, 10, "Suggests settings in the Advisor tab.")
+
     def _build_behaviour_card(self, form):
-        """Behaviour section: optional file, circular names, null shuffles."""
+        """Behaviour section: optional file, circular names, null shuffles,
+        decoder, PSID rows and the (label-free) co-smoothing score."""
         c = self._card(form, "Behaviour")
         e = self._entry(c, self.var_beh)
         b = ttk.Button(c, text="Browse", style="Small.TButton", command=self._browse_behaviour)
@@ -1115,9 +1552,36 @@ class App:
         self._row(c, 3, "Shuffles", self._entry(c, self.var_nperm), name="n_perm",
                   tip="Circular-shift permutations of the decoding null distribution "
                       "(0 = no significance test).")
+        self._row(c, 4, "Decoder", self._combo(c, self.var_decoder, DECODERS), name="decoder",
+                  tip="linear = ridge regression / shrinkage LDA (default, 'explicitly "
+                      "represented'); knn = local non-linear read-out; gbm = gradient-boosted "
+                      "trees (strongest, slowest, null capped at 49 shifts); logistic = "
+                      "logistic regression for discrete targets (ridge for continuous ones).")
+        px = self.px
+        # stacked: side by side the two labels would touch the edge of the card
+        box = ttk.Frame(c, style="Panel.TFrame")
+        box.grid(row=5, column=1, columnspan=2, sticky="w", pady=(px(2), px(1)))
+        self.ck_psid = ttk.Checkbutton(box, text="PSID rows", variable=self.var_psid)
+        self.ck_psid.pack(side="top", anchor="w")
+        self.ck_cosmooth = ttk.Checkbutton(box, text="Co-smoothing score",
+                                           variable=self.var_cosmooth)
+        self.ck_cosmooth.pack(side="top", anchor="w", pady=(px(2), 0))
+        if importlib.util.find_spec("PSID") is None:
+            self.var_psid.set(False)
+            self.ck_psid.state(["disabled"])
+            Tooltip(self.ck_psid, "Unavailable: needs the PSID package (pip install PSID).", self)
+        else:
+            Tooltip(self.ck_psid, "Add cross-fitted PSID decoding rows (Sani et al. 2021: "
+                                  "behaviourally relevant dynamics from the raw input) for "
+                                  "continuous and circular targets. No permutation null.", self)
+        Tooltip(self.ck_cosmooth, "After fitting, score the embedding by co-smoothing: bits per "
+                                  "spike predicted for held-out neurons on held-out time (Neural "
+                                  "Latents Benchmark). Label-free; needs raw counts (spikes or "
+                                  "integer data); refits the backbone once.", self)
 
     def _build_model_card(self, form):
-        """Model section: backbone (+ CPU hint), speed chips, objective, K, steps."""
+        """Model section: backbone (+ CPU hint), speed chips, objective,
+        likelihood, masking, K, state model, embedding size, steps, smoothing."""
         px = self.px
         c = self._card(form, "Model")
         self.cb_backbone = self._combo(c, self.var_backbone, list(self._bb_display.values()),
@@ -1148,15 +1612,37 @@ class App:
                   name="objective",
                   tip="masked = reconstruct hidden frames; contrastive = time-contrastive "
                       "InfoNCE; hybrid = both.")
-        self._row(c, 5, "States", self._combo(c, self.var_states,
+        self._row(c, 5, "Likelihood", self._combo(c, self.var_likelihood, LIKELIHOODS),
+                  name="likelihood",
+                  tip="Reconstruction loss of the masked objective. gaussian = squared error "
+                      "on the scaled input; poisson = Poisson log-likelihood on raw counts "
+                      "(spikes or integer data only; disables input PCA); auto = poisson when "
+                      "raw counts exist, else gaussian.")
+        self._row(c, 6, "Masking", self._combo(c, self.var_mask_mode, MASK_CHOICES),
+                  name="mask_mode",
+                  tip="What the masked objective hides: time = spans of frames; neuron = "
+                      "whole channels (learns population structure); both = alternate.")
+        self._row(c, 7, "States", self._combo(c, self.var_states,
                                               ["auto"] + [str(k) for k in range(2, 11)],
                                               readonly=False),
                   name="n_states",
-                  tip="Number of discrete states K. 'auto' picks K in 2-10 by silhouette.")
-        self._row(c, 6, "Max steps", self._entry(c, self.var_max_steps), name="max_steps",
+                  tip="Number of discrete states K. 'auto' picks K in 2-10 by silhouette "
+                      "(or by held-out likelihood for hmm / arhmm).")
+        self.cb_state_model = ttk.Combobox(c, textvariable=self.var_state_model,
+                                           values=STATE_MODELS, width=8, state="readonly",
+                                           postcommand=self._refresh_state_models)
+        widgets = self._row(c, 8, "State model", self.cb_state_model, name="state_model")
+        self._state_tips = [Tooltip(w, "", self) for w in widgets]
+        self._row(c, 9, "Embedding dim", self._combo(c, self.var_emb_dim, EMB_DIMS,
+                                                     readonly=False),
+                  name="emb_dim",
+                  tip="Size of the embedding. 'auto' = backbone default (32; 8 for gpfa and "
+                      "cebra). The advisor suggests about twice the number of PCs that hold "
+                      "90 % of the variance.")
+        self._row(c, 10, "Max steps", self._entry(c, self.var_max_steps), name="max_steps",
                   tip="Override the preset step budget (blank = preset). Early stopping may "
                       "end training sooner.")
-        self._row(c, 7, "Smoothing", self._entry(c, self.var_smooth), name="smooth",
+        self._row(c, 11, "Smoothing", self._entry(c, self.var_smooth), name="smooth",
                   tip="Gaussian smoothing of the embedding, sigma in frames (0 = off).")
 
     def _build_output_card(self, form):
@@ -1168,12 +1654,21 @@ class App:
         self._row(c, 0, "Folder", e, b, name="outdir",
                   tip="Figures (png / pdf / svg), CSV tables, GIF and HTML explorer go here.")
         self._row(c, 1, "Projection", self._combo(c, self.var_gif_method, PROJECTIONS),
-                  name="gif_method", tip="2-D map used by the trajectory GIF and the HTML explorer.")
+                  name="gif_method",
+                  tip="Projection used by the trajectory GIF, the HTML explorer (2-D map and "
+                      "its 3-D view; t-SNE falls back to PCA in 3-D) and the flow field. "
+                      "tphate = time-aware T-PHATE (about 5-10 s for 3000 frames).")
+        # stacked: with the sidebar scrollbar shown, side by side they would be clipped
         box = ttk.Frame(c, style="Panel.TFrame")
         box.grid(row=2, column=1, columnspan=2, sticky="w", pady=(px(2), px(2)))
-        ttk.Checkbutton(box, text="Trajectory GIF", variable=self.var_gif).pack(side="left")
-        ttk.Checkbutton(box, text="HTML explorer", variable=self.var_html).pack(
-            side="left", padx=(px(14), 0))
+        ttk.Checkbutton(box, text="Trajectory GIF", variable=self.var_gif).pack(side="top",
+                                                                                anchor="w")
+        ck_html = ttk.Checkbutton(box, text="HTML explorer (2-D / 3-D)", variable=self.var_html)
+        ck_html.pack(side="top", anchor="w", pady=(px(2), 0))
+        Tooltip(ck_html, "Self-contained interactive page: hover, colour switch, playback, "
+                         "light / dark theme and a 3-D view (drag to rotate, wheel to zoom). "
+                         "Views can be shared with the URL hash, e.g. "
+                         "#color=state&t=0.45&view=3d.", self)
         row = ttk.Frame(c, style="Panel.TFrame")
         row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(px(6), 0))
         row.columnconfigure((0, 1), weight=1, uniform="open")
@@ -1211,7 +1706,7 @@ class App:
 
     # ----- main area -------------------------------------------------------- #
     def _build_main(self, parent):
-        """Notebook with the six result tabs."""
+        """Notebook with the result tabs, in workflow order (advice first)."""
         px = self.px
         main = ttk.Frame(parent, style="App.TFrame", padding=(px(14), px(12), px(14), px(10)))
         self.nb = ttk.Notebook(main)
@@ -1219,6 +1714,8 @@ class App:
         self.panes = {}
         empty_run = ("No results yet.\nPress Run (Ctrl+R). With an empty data file the "
                      "synthetic demo is used.")
+        self.tab_advisor = self._build_advisor_tab(self.nb)
+        self.nb.add(self.tab_advisor, text="Advisor")
         self.panes["overview"] = FigurePane(self.nb, self, "Dashboard", empty_run,
                                             SCALE_CAP["overview"])
         self.nb.add(self.panes["overview"], text="Overview")
@@ -1228,6 +1725,8 @@ class App:
         self.nb.add(self.panes["embedding"], text="Embedding")
         self.tab_decoding = self._build_decoding_tab(self.nb)
         self.nb.add(self.tab_decoding, text="Decoding")
+        self.tab_dynamics = self._build_dynamics_tab(self.nb)
+        self.nb.add(self.tab_dynamics, text="Dynamics")
         self.panes["training"] = FigurePane(self.nb, self, "Training curves", empty_run,
                                             SCALE_CAP["training"])
         self.nb.add(self.panes["training"], text="Training")
@@ -1235,7 +1734,84 @@ class App:
         self.nb.add(self.tab_compare, text="Compare")
         self.tab_log = self._build_log_tab(self.nb)
         self.nb.add(self.tab_log, text="Log")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         return main
+
+    def _build_advisor_tab(self, nb):
+        """Advisor tab: data-profile figure (top) and the formatted advice (bottom)."""
+        px = self.px
+        pw = ttk.Panedwindow(nb, orient="vertical")
+        self.panes["advisor"] = FigurePane(
+            pw, self, "Data profile",
+            "No analysis yet.\nChoose a goal in the Data card and press 'Analyse data' to "
+            "profile the recording (empty file = synthetic demo) and get a suggested pipeline.",
+            SCALE_CAP["advisor"], min_h=330)
+        pw.add(self.panes["advisor"], weight=3)
+        box = ttk.Frame(pw, style="Panel.TFrame")
+        head = ttk.Frame(box, style="Panel.TFrame")
+        head.pack(fill="x", padx=px(16), pady=(px(10), px(6)))
+        ttk.Label(head, text="Recommendation", style="PaneTitle.TLabel").pack(side="left")
+        self.btn_run_suggested = ttk.Button(head, text="Run suggested", style="Accent.TButton",
+                                            command=self.run_suggested)
+        self.btn_run_suggested.pack(side="right")
+        self.btn_apply = ttk.Button(head, text="Apply suggestions", command=self.apply_suggestions)
+        self.btn_apply.pack(side="right", padx=(0, px(8)))
+        self.lbl_advice = ttk.Label(head, text="rule-based suggestions from measured properties",
+                                    style="Caption.TLabel")
+        self.lbl_advice.pack(side="left", padx=(px(12), px(12)))
+        Tooltip(self.btn_apply, "Copy the advice into the sidebar: backbone, speed, objective, "
+                                "likelihood, masking, states, state model, smoothing, embedding "
+                                "size, decoder, shuffles, circular variables, Compare list (and "
+                                "bin size / input type for a file). Changes are listed in the "
+                                "Log.", self)
+        Tooltip(self.btn_run_suggested, "Apply the suggestions, then Run. Also uses the advice "
+                                        "that has no sidebar field (training window, input PCA, "
+                                        "the demo's bin size).", self)
+        ttk.Frame(box, style="Line.TFrame", height=1).pack(fill="x")
+        self.report = ReportView(box, self, "The report appears here after 'Analyse data'.")
+        self.report.pack(fill="both", expand=True)
+        pw.add(box, weight=2)
+        return pw
+
+    def _build_dynamics_tab(self, nb):
+        """Dynamics tab: selectable figure (top), its statistics and a reading guide."""
+        px = self.px
+        pw = ttk.Panedwindow(nb, orient="vertical")
+        pane = FigurePane(pw, self, "Latent dynamics",
+                          "No dynamics yet.\nRun a model: topology, flow field, recurrence, "
+                          "raster and state contingency figures are drawn here on demand.",
+                          SCALE_CAP["dynamics"], min_h=420)
+        self.panes["dynamics"] = pane
+        ttk.Label(pane.controls, text="Figure", style="Caption.TLabel").pack(side="left")
+        self.cb_dyn = ttk.Combobox(pane.controls, textvariable=self.var_dyn_fig, values=[],
+                                   width=20, state="readonly")
+        self.cb_dyn.pack(side="left", padx=(px(6), 0))
+        self.cb_dyn.bind("<<ComboboxSelected>>", self._on_dyn_change)
+        self.cb_dyn.state(["disabled"])
+        pw.add(pane, weight=4)
+        box = ttk.Frame(pw, style="Panel.TFrame")
+        left = ttk.Frame(box, style="Panel.TFrame")
+        right = ttk.Frame(box, style="Panel.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(px(16), px(8)), pady=(px(10), px(12)))
+        right.grid(row=0, column=1, sticky="nsew", padx=(px(8), px(16)), pady=(px(10), px(12)))
+        box.columnconfigure(0, weight=1, uniform="dyn")      # table and guide share the width
+        box.columnconfigure(1, weight=1, uniform="dyn")
+        box.rowconfigure(0, weight=1)
+        ttk.Label(left, text="Statistics", style="PaneTitle.TLabel").pack(anchor="w",
+                                                                          pady=(0, px(6)))
+        f, self.tree_dyn = self._make_tree(left, [("stat", "statistic", 120, "w"),
+                                                  ("value", "value", 80, "e")], height=4)
+        f.pack(fill="both", expand=True)
+        ttk.Label(right, text="How to read it", style="PaneTitle.TLabel").pack(anchor="w",
+                                                                               pady=(0, px(6)))
+        self.lbl_dyn_help = ttk.Label(right, text="", style="Caption.TLabel", justify="left",
+                                      wraplength=px(420))
+        self.lbl_dyn_help.pack(anchor="nw", fill="x")
+        # keep the reading guide wrapped to the width of its column
+        right.bind("<Configure>", lambda e: self.lbl_dyn_help.configure(
+            wraplength=max(e.width - px(4), px(160))))
+        pw.add(box, weight=1)
+        return pw
 
     def _view_controls(self, parent, var_proj, var_color, colors, callback):
         """'Projection [..]  Colour by [..]' pair used in figure headers."""
@@ -1292,6 +1868,20 @@ class App:
             pw, self, "Backbone comparison",
             "No comparison yet.\nList backbones next to the Compare button and press it.",
             SCALE_CAP["compare"], min_h=400)
+        # segmented toggle: embedding grid | consistency matrix (packed before the selectors)
+        seg = ttk.Frame(self.panes["compare"].controls, style="Panel.TFrame")
+        seg.pack(side="left", padx=(0, px(16)))
+        self.rb_cmp_mode = {}
+        for i, (val, text) in enumerate((("grid", "Embeddings"), ("consistency", "Consistency"))):
+            rb = ttk.Radiobutton(seg, text=text, value=val, variable=self.var_cmp_mode,
+                                 style="Segment.TRadiobutton", command=self._on_cmp_mode,
+                                 takefocus=False, width=11)
+            rb.grid(row=0, column=i, padx=(0 if i == 0 else px(3), 0))
+            rb.state(["disabled"])
+            self.rb_cmp_mode[val] = rb
+        Tooltip(self.rb_cmp_mode["consistency"], "Pairwise linear consistency: cross-validated "
+                                                 "R² of a linear map from one embedding "
+                                                 "(row) to another (column), as in CEBRA.", self)
         self.cb_cmp_proj, self.cb_cmp_color = self._view_controls(
             self.panes["compare"].controls, self.var_cmp_proj, self.var_cmp_color,
             ["state", "time"], self._on_cmp_view_change)
@@ -1528,17 +2118,80 @@ class App:
         else:
             p = self.var_file.get().strip()
             ok = os.path.isfile(p)
-            self.hint_file.configure(text=(f"{os.path.getsize(p) / 1e6:.1f} MB" if ok
-                                           else "file not found"))
+            text = f"{os.path.getsize(p) / 1e6:.1f} MB" if ok else "file not found"
+            if ok and self._advice_matches():
+                # the advisor already identified this file: say what it is
+                from .advisor import MODALITIES
+                mod = self.rec.profile.modality
+                text += f"  ·  {MODALITIES.get(mod, mod)}"
+            self.hint_file.configure(text=text)
+        if hasattr(self, "btn_apply"):
+            self._refresh_advice_buttons()
 
     def _on_backbone(self):
-        """Update the CPU-cost hint under the backbone selector."""
+        """Update the CPU-cost hint under the backbone selector ('cebra' also
+        needs its package: the hint says so when it is not installed)."""
         key = self._bb_key.get(self.var_backbone.get())
         if key is None:
             return
-        text, col = COST_TEXT.get(CPU_COST_HINT.get(key, "fast"), COST_TEXT["fast"])
+        cost = CPU_COST_HINT.get(key, "fast")
+        if key == "cebra" and importlib.util.find_spec("cebra") is None:
+            cost = "missing"
+        text, col = COST_TEXT.get(cost, COST_TEXT["fast"])
         self.lbl_cost.configure(text=text)
         self.lbl_cost_dot.configure(foreground=PALETTE[col])
+
+    def _states_ok(self):
+        """True when the temporal state models (hmm / arhmm) can be imported.
+
+        ``embedders_backbones.states`` may still be under construction: a
+        failed import is retried on the next call (e.g. when the State model
+        drop-down opens), a success is remembered."""
+        if self._states_ok_cache:
+            return True
+        try:
+            mod = importlib.import_module(".states", __package__ or "embedders_backbones")
+            ok = hasattr(mod, "fit_states")
+            self._states_error = "" if ok else "states.fit_states is missing"
+        except Exception as exc:  # noqa: BLE001
+            ok, self._states_error = False, f"{type(exc).__name__}: {exc}"
+        self._states_ok_cache = ok or None
+        return ok
+
+    def _refresh_state_models(self):
+        """Offer hmm / arhmm only when importable; explain why in the tooltip."""
+        ok = self._states_ok()
+        base = ("Discrete states from the embedding. auto = backbone default (K-means; DEC "
+                "for dtc; CRF for enc_crf); kmeans = K-means; hmm = sticky Gaussian HMM; "
+                "arhmm = autoregressive HMM (pose-like dynamics). hmm / arhmm pick K by "
+                "held-out likelihood when States is 'auto'.")
+        if ok:
+            self.cb_state_model.configure(values=STATE_MODELS)
+            tip = base
+        else:
+            self.cb_state_model.configure(values=["auto", "kmeans"])
+            if self.var_state_model.get() not in ("auto", "kmeans"):
+                self.var_state_model.set("auto")
+            tip = (base + "\n\nhmm / arhmm are unavailable: the temporal state models could "
+                   f"not be imported ({self._states_error}).")
+        for t in getattr(self, "_state_tips", []):
+            t.text = tip
+
+    def _advice_matches(self):
+        """True when the last recommendation belongs to the current data fields."""
+        return (self.rec is not None and
+                self._rec_key == (self.var_file.get().strip(), self.var_type.get()))
+
+    def _refresh_advice_buttons(self):
+        """Enable Apply / Run suggested only for advice on the current data."""
+        ok = self._advice_matches() and not self.busy
+        for b in (self.btn_apply, self.btn_run_suggested):
+            b.state(["!disabled"] if ok else ["disabled"])
+        if self.rec is not None and not self._advice_matches():
+            self.lbl_advice.configure(text="the data fields changed: press 'Analyse data' again",
+                                      foreground=PALETTE["warn"])
+        elif self.rec is not None:
+            self.lbl_advice.configure(text=self._advice_caption(), foreground=PALETTE["muted"])
 
     def _on_speed(self):
         """Describe the selected speed preset (and a max-steps override)."""
@@ -1618,12 +2271,28 @@ class App:
             raise _FormError(f"behaviour file not found: {cfg['beh_file']}", F.get("beh_file"))
         cfg["circular"] = [c.strip() for c in self.var_circ.get().split(",") if c.strip()]
         cfg["n_perm"] = number(self.var_nperm, "n_perm", int, 0, what="an integer")
+        cfg["decoder"] = self.var_decoder.get() if self.var_decoder.get() in DECODERS else "linear"
+        cfg["psid"] = bool(self.var_psid.get())
+        cfg["cosmooth"] = bool(self.var_cosmooth.get())
+        cfg["goal"] = self.var_goal.get() if self.var_goal.get() in GOALS else "auto"
         bb = self._bb_key.get(self.var_backbone.get())
         if bb is None:
             raise _FormError("choose a backbone", F.get("backbone"))
         cfg["backbone"] = bb
         cfg["speed"] = self.var_speed.get()
         cfg["objective"] = self.var_objective.get()
+        cfg["likelihood"] = self.var_likelihood.get()
+        cfg["mask_mode"] = self.var_mask_mode.get()
+        cfg["state_model"] = self.var_state_model.get()
+        if cfg["state_model"] in ("hmm", "arhmm") and not self._states_ok():
+            raise _FormError(f"state model {cfg['state_model']} is unavailable "
+                             f"({self._states_error})", F.get("state_model"))
+        ed = self.var_emb_dim.get().strip().lower()
+        if ed in ("", "auto"):
+            cfg["emb_dim"] = None
+        else:
+            cfg["emb_dim"] = number(self.var_emb_dim, "emb_dim", int, 1,
+                                    what="'auto' or an integer")
         ns = self.var_states.get().strip().lower()
         if ns in ("", "auto"):
             cfg["n_states"] = "auto"
@@ -1647,6 +2316,14 @@ class App:
         cfg["compare"] = bbs
         cfg["cmp_method"] = self.var_cmp_proj.get() or "umap"
         cfg["cmp_color"] = self.var_cmp_color.get() or "state"
+        cfg["extra"] = {}               # Embedder kwargs without a sidebar field (Run suggested)
+        cfg["demo_bin"] = None          # bin size of the synthetic demo (None = its native 0.1 s)
+        # the advisor's fit method / time axis for this file ('auto' input), if analysed
+        cfg["advice"] = None
+        if self._advice_matches():
+            cfg["advice"] = dict(fit_method=self.rec.fit_method,
+                                 fit_kwargs=dict(self.rec.fit_kwargs),
+                                 time_axis=int(self.rec.profile.time_axis))
         return cfg
 
     def _form_error(self, err):
@@ -1661,8 +2338,12 @@ class App:
                 pass
 
     # ------------------------------------------------------------ job control --
-    def run(self):
-        """Start a single-backbone job (Run button)."""
+    def run(self, extra=None, demo_bin=None):
+        """Start a single-backbone job (Run button).
+
+        ``extra`` are additional ``Embedder`` kwargs without a sidebar field
+        (e.g. win_len, input_pca from the advisor); ``demo_bin`` overrides
+        the synthetic demo's bin size. Both are used by ``run_suggested``."""
         if self.busy:
             return
         try:
@@ -1670,9 +2351,136 @@ class App:
         except _FormError as err:
             self._form_error(err)
             return
+        cfg["extra"] = dict(extra or {})
+        cfg["demo_bin"] = demo_bin
         self._begin_job("run", self._run_worker, cfg,
                         f"{label(cfg['backbone'])} on "
                         f"{os.path.basename(cfg['file']) or 'synthetic demo'}")
+
+    def analyse(self):
+        """Start the data advisor on the current data (Analyse data button)."""
+        if self.busy:
+            return
+        try:
+            cfg = self._collect_config()
+        except _FormError as err:
+            self._form_error(err)
+            return
+        self._begin_job("advise", self._advise_worker, cfg,
+                        f"data advisor on {os.path.basename(cfg['file']) or 'synthetic demo'} "
+                        f"(goal {cfg['goal']})")
+
+    def apply_suggestions(self, _event=None):
+        """Copy the last recommendation into the sidebar fields.
+
+        Every changed field is listed in the Log ('old -> new'); the status
+        bar shows a one-line summary. Returns True when the advice applied."""
+        if self.busy:
+            return False
+        if not self._advice_matches():
+            self._set_status("No advice for the current data: press 'Analyse data' first.",
+                             dot="warn")
+            return False
+        rec = self.rec
+        kw = rec.embedder_kwargs
+        changes = []
+
+        def put(var, value, name):
+            """Set ``var`` to ``value`` and remember the change for the log."""
+            old = var.get()
+            if str(old) != str(value):
+                var.set(value)
+                changes.append(f"{name}: {old if old != '' else '(blank)'} -> {value}")
+
+        bb = kw.get("backbone")
+        if bb in self._bb_display:
+            old = self._bb_key.get(self.var_backbone.get())
+            if old != bb:
+                self.var_backbone.set(self._bb_display[bb])
+                changes.append(f"backbone: {old} -> {bb}")
+        if kw.get("speed") in SPEEDS:
+            put(self.var_speed, kw["speed"], "speed")
+        if kw.get("objective") in OBJECTIVES:
+            put(self.var_objective, kw["objective"], "objective")
+        if kw.get("likelihood") in LIKELIHOODS:
+            put(self.var_likelihood, kw["likelihood"], "likelihood")
+        if kw.get("mask_mode") in MASK_CHOICES:
+            put(self.var_mask_mode, kw["mask_mode"], "masking")
+        sm = kw.get("state_model", "auto")
+        if sm in ("hmm", "arhmm") and not self._states_ok():
+            self._log(f"advisor suggests the {sm} state model, which is unavailable "
+                      f"({self._states_error}): keeping 'auto'", "warn")
+            sm = "auto"
+        if sm in STATE_MODELS:
+            put(self.var_state_model, sm, "state model")
+        ns = kw.get("n_states")
+        put(self.var_states, "auto" if ns in (None, "auto") else str(int(ns)), "states")
+        if kw.get("smooth_sigma") is not None:
+            put(self.var_smooth, f"{float(kw['smooth_sigma']):g}", "smoothing")
+        ed = kw.get("embedding_dim")
+        put(self.var_emb_dim, "auto" if ed is None else str(int(ed)), "embedding dim")
+        dec = rec.decoding or {}
+        if dec.get("model") in DECODERS:
+            put(self.var_decoder, dec["model"], "decoder")
+        if dec.get("n_perm") is not None:
+            put(self.var_nperm, str(int(dec["n_perm"])), "shuffles")
+        if dec.get("circular") is not None:
+            put(self.var_circ, ",".join(dec["circular"]), "circular")
+        cmp_list = [b for b in rec.compare if b in self._bb_display]
+        if cmp_list:
+            put(self.var_compare, ",".join(cmp_list), "compare")
+        if self.var_file.get().strip():
+            # file input: bin size and, for an explicit input type, how to read the file
+            if kw.get("bin_size") is not None:
+                put(self.var_bin, f"{float(kw['bin_size']):g}", "bin size")
+            if self.var_type.get() != "auto":
+                typ = FIT_TO_INPUT.get(rec.fit_method)
+                if typ == "timeseries" and rec.profile.modality == "pose":
+                    typ = "pose"
+                fk = rec.fit_kwargs or {}
+                if "time_axis" in fk:
+                    put(self.var_taxis, TIME_AXES[0] if int(fk["time_axis"]) == 1
+                        else TIME_AXES[1], "time axis")
+                if fk.get("fs"):
+                    put(self.var_fs, f"{float(fk['fs']):g}", "fs")
+                if "dff" in fk:
+                    put(self.var_dff, bool(fk["dff"]), "dF/F")
+                if typ and typ != self.var_type.get():
+                    put(self.var_type, typ, "input type")
+                    self._rec_key = (self.var_file.get().strip(), typ)   # still the same data
+        self._on_speed()
+        self._on_backbone()
+        self._on_data_change()
+        for c in changes:
+            self._log(f"  advisor applied  {c}", "ok")
+        extra = self._advice_extra()
+        note = ("" if not extra else "  |  Run suggested also uses " +
+                ", ".join(f"{k} {v}" for k, v in extra.items()))
+        self._set_status(f"Advisor suggestions applied: {len(changes)} field"
+                         f"{'' if len(changes) == 1 else 's'} changed{note}", dot="ok")
+        self._log(f"advisor suggestions applied ({len(changes)} changes)", "head")
+        return True
+
+    def _advice_extra(self):
+        """Advice that has no sidebar field: win_len, input_pca and, for the
+        synthetic demo, the suggested bin size (passed by ``run_suggested``)."""
+        if self.rec is None:
+            return {}
+        kw = self.rec.embedder_kwargs
+        # input_pca 'auto' is the Embedder default: not worth mentioning or passing
+        out = {k: kw[k] for k in ("win_len", "input_pca")
+               if kw.get(k) is not None and not (k == "input_pca" and kw[k] == "auto")}
+        if not self.var_file.get().strip() and kw.get("bin_size") is not None:
+            out["bin_size"] = kw["bin_size"]
+        return out
+
+    def run_suggested(self, _event=None):
+        """Apply the suggestions, then run with the advice's extra settings."""
+        if self.busy or not self.apply_suggestions():
+            return
+        extra = self._advice_extra()
+        demo_bin = extra.pop("bin_size", None)
+        self.run(extra=extra, demo_bin=demo_bin)
 
     def compare(self):
         """Start a comparison job over the Compare list (Compare button)."""
@@ -1704,9 +2512,11 @@ class App:
         self._save_settings()
         self.busy = True
         self._job_kind = kind
+        self._job_note = ""
         self._stop.clear()
-        self.btn_run.state(["disabled"])
-        self.btn_cmp.state(["disabled"])
+        for b in (self.btn_run, self.btn_cmp, self.btn_analyse, self.btn_apply,
+                  self.btn_run_suggested):
+            b.state(["disabled"])
         self.btn_stop.state(["!disabled"])
         self._progress_determinate(0)
         self._job_t0 = time.perf_counter()
@@ -1738,14 +2548,16 @@ class App:
         el = time.perf_counter() - (self._job_t0 or time.perf_counter())
         self.busy = False
         self.last_status, self.last_elapsed = status, el
-        self.btn_run.state(["!disabled"])
-        self.btn_cmp.state(["!disabled"])
+        for b in (self.btn_run, self.btn_cmp, self.btn_analyse):
+            b.state(["!disabled"])
         self.btn_stop.state(["disabled"])
+        self._refresh_advice_buttons()
         self.var_elapsed.set(f"{el:.1f} s")
-        what = "Comparison" if kind == "compare" else "Run"
+        what = {"compare": "Comparison", "advise": "Analysis"}.get(kind, "Run")
         if status == "done":
             self._progress_determinate(100)
-            self._set_status(f"{what} finished in {el:.1f} s  |  outputs in "
+            where = "advice and profile in" if kind == "advise" else "outputs in"
+            self._set_status(f"{what} finished in {el:.1f} s{self._job_note}  |  {where} "
                              f"{_short_path(self.last_outdir or '', 3)}", dot="ok")
             self._log(f"{what.lower()} finished in {el:.1f} s", "ok")
         elif status == "stopped":
@@ -1870,13 +2682,23 @@ class App:
     # Everything below until "main-thread result display" runs in a worker
     # thread: no Tk calls, only self._post(...) and the reporter callbacks.
     def _load_data(self, cfg, rep):
-        """Worker: read the recording + behaviour (or build the demo)."""
-        out = dict(behavior=None, behavior_times=None, circular=list(cfg["circular"]))
+        """Worker: read the recording + behaviour (or build the demo).
+
+        Returns a dict with the payload and how to fit it: ``kind`` is
+        'spikes' | 'coco_mask' | 'fiber_photometry' | 'features' (any other
+        matrix), plus ``time_axis``, ``times``, ``fs``, ``dff`` and
+        ``bin_size``. Input type 'auto' reads the file with
+        ``data.load_auto``; a matrix then follows the advisor's fit method
+        and time axis when this file was analysed, else the time axis is
+        detected (lag-1 autocorrelation, ``advisor.detect_time_axis``)."""
+        out = dict(behavior=None, behavior_times=None, circular=list(cfg["circular"]),
+                   time_axis=cfg["time_axis"], times=None, fs=cfg["fs"], dff=cfg["dff"],
+                   bin_size=cfg["bin_size"])
         if not cfg["file"]:
             rep.phase("simulating the synthetic demo recording")
             ds = make_dataset(seed=0)
-            out.update(kind="spikes", payload=ds["spike_times"], bin_size=float(ds["dt"]),
-                       name="synthetic demo")
+            out.update(kind="spikes", payload=ds["spike_times"], name="synthetic demo",
+                       bin_size=float(cfg.get("demo_bin") or ds["dt"]))
             if not cfg["beh_file"]:
                 out["behavior"], out["behavior_times"] = ds["behavior"], ds["times"]
                 if "phase" not in out["circular"]:
@@ -1884,18 +2706,56 @@ class App:
         else:
             path, typ = cfg["file"], cfg["input_type"]
             rep.phase(f"loading {os.path.basename(path)}")
-            if typ == "spikes":
-                kind, payload = "spikes", _data.load_spikes(path)
+            out["name"] = os.path.basename(path)
+            if typ == "auto":
+                self._load_auto(path, cfg, out, rep)
+            elif typ == "spikes":
+                out.update(kind="spikes", payload=_data.load_spikes(path))
             elif typ == "coco_mask" or (typ == "mask" and path.lower().endswith(".json")):
-                kind, payload = "coco_mask", path
+                out.update(kind="coco_mask", payload=path)
+            elif typ == "fiber_photometry":
+                out.update(kind="fiber_photometry", payload=_data.load_array(path))
             else:
-                kind, payload = typ, _data.load_array(path)
-            out.update(kind=kind, payload=payload, bin_size=cfg["bin_size"],
-                       name=os.path.basename(path))
+                out.update(kind="features", payload=_data.load_array(path))
         if cfg["beh_file"]:
             out["behavior"], out["behavior_times"] = _data.load_behavior(cfg["beh_file"])
         rep.check()
         return out
+
+    @staticmethod
+    def _load_auto(path, cfg, out, rep):
+        """Worker: fill ``out`` for input type 'auto' (see ``_load_data``)."""
+        payload, hints = _data.load_auto(path)
+        kind = hints.get("kind")
+        out["fs"] = out["fs"] or hints.get("fs")
+        adv = cfg.get("advice")
+        if kind == "spike_times":
+            out.update(kind="spikes", payload=payload)
+            how = f"{len(payload)} spike trains, {cfg['bin_size']:g} s bins"
+        elif kind == "coco":
+            out.update(kind="coco_mask", payload=payload)
+            how = "COCO masks"
+        elif kind in ("pose", "table"):
+            # rows of a table / DeepLabCut file are time
+            out.update(kind="features", payload=payload, time_axis=0, times=hints.get("times"))
+            how = f"{kind} with {np.shape(payload)[1]} columns, time along rows"
+        elif adv is not None and adv["fit_method"] == "fit_fiber":
+            fk = adv["fit_kwargs"]
+            out.update(kind="fiber_photometry", payload=payload,
+                       time_axis=int(fk.get("time_axis", 1)), dff=bool(fk.get("dff", False)),
+                       fs=fk.get("fs") or out["fs"])
+            how = f"fiber photometry as advised (dF/F {'on' if out['dff'] else 'off'})"
+        else:
+            if adv is not None:
+                axis, src = int(adv["time_axis"]), "advisor"
+            else:
+                from .advisor import detect_time_axis
+                axis, conf = detect_time_axis(np.asarray(payload, float))
+                src = f"detected, {conf} confidence"
+            out.update(kind="features", payload=payload, time_axis=int(axis),
+                       times=hints.get("times"))
+            how = f"matrix {np.shape(payload)}, time axis {axis} ({src})"
+        rep.post("log", (f"auto input: {how}", "muted"))
 
     @staticmethod
     def _fit(emb, data, cfg):
@@ -1905,24 +2765,40 @@ class App:
             emb.fit_spikes(p)
         elif kind == "coco_mask":
             s = cfg["mask_size"]
-            emb.fit_coco_masks(p, resize=(s, s), channel_key=cfg["mask_key"], fps=cfg["fs"])
+            emb.fit_coco_masks(p, resize=(s, s), channel_key=cfg["mask_key"], fps=data["fs"])
         elif kind == "fiber_photometry":
-            emb.fit_fiber(p, time_axis=cfg["time_axis"], dff=cfg["dff"], fs=cfg["fs"])
+            emb.fit_fiber(p, time_axis=data["time_axis"], dff=data["dff"], fs=data["fs"])
         else:
-            emb.fit_features(p, time_axis=cfg["time_axis"])
+            times = data.get("times")
+            if times is not None and len(times) != np.shape(p)[data["time_axis"]]:
+                times = None                          # time column does not match: frame index
+            emb.fit_features(p, time_axis=data["time_axis"], times=times)
+
+    @staticmethod
+    def _embedder_kwargs(cfg):
+        """Embedder settings shared by Run and Compare (from the sidebar)."""
+        return dict(n_states=cfg["n_states"], speed=cfg["speed"], objective=cfg["objective"],
+                    max_steps=cfg["max_steps"], smooth_sigma=cfg["smooth"],
+                    likelihood=cfg["likelihood"], mask_mode=cfg["mask_mode"],
+                    state_model=cfg["state_model"], embedding_dim=cfg["emb_dim"])
 
     def _run_worker(self, cfg):
         """Worker: fit one backbone, write outputs, build every figure."""
         bb = cfg["backbone"]
         rep = _Reporter(self._post, self._stop, [bb], "embedding + automatic state selection")
         data = self._load_data(cfg, rep)
-        emb = Embedder(bb, bin_size=data["bin_size"], n_states=cfg["n_states"],
-                       speed=cfg["speed"], objective=cfg["objective"],
-                       max_steps=cfg["max_steps"], smooth_sigma=cfg["smooth"],
-                       log=rep.log, progress=rep.progress)
+        kw = self._embedder_kwargs(cfg)
+        kw.update(cfg.get("extra") or {})
+        if cfg.get("extra"):
+            rep.post("log", ("advisor extras: " + ", ".join(f"{k}={v}" for k, v in
+                                                             cfg["extra"].items()), "muted"))
+        emb = Embedder(bb, bin_size=data["bin_size"], log=rep.log, progress=rep.progress, **kw)
         rep.phase(f"{bb}: preparing input and model")
         self._fit(emb, data, cfg)
 
+        cos = None
+        if cfg["cosmooth"]:
+            cos = self._cosmooth(emb, rep)
         # projections are cached by the Embedder: computing them here (one at
         # a time) gives stage feedback and a Stop checkpoint between them
         order = ["pca", "tsne", "umap"]
@@ -1933,68 +2809,172 @@ class App:
             emb.projection(m)
         rep.check()
         beh, bt, circ = data["behavior"], data["behavior_times"], data["circular"]
-        what = "decoding behaviour, " if beh is not None else ""
-        rep.phase(f"{bb}: {what}writing figures, tables, GIF and explorer  ({n_st - 1}/{n_st})")
-        met = emb.run(cfg["outdir"], behavior=beh, behavior_times=bt, animate=cfg["gif"],
+        aligned = emb._align(beh, bt, None, circ) if beh is not None else None
+        if aligned:
+            # decode here (decoder choice, PSID rows); run() then reuses emb.decoding
+            rep.phase(f"{bb}: decoding behaviour ({cfg['decoder']}"
+                      + (", PSID" if cfg["psid"] else "") + ")")
+            emb.decode(aligned, circular=circ, model=cfg["decoder"], n_perm=cfg["n_perm"],
+                       psid=cfg["psid"])
+            rep.check()
+        rep.phase(f"{bb}: writing figures, tables, dynamics, GIF and explorer  ({n_st - 1}/{n_st})")
+        met = emb.run(cfg["outdir"], behavior=aligned, behavior_times=None, animate=cfg["gif"],
                       gif_method=cfg["gif_method"], html=cfg["html"], circular=circ,
-                      n_perm=cfg["n_perm"])
+                      n_perm=cfg["n_perm"], decode=False)
+        if emb.decoding is not None:
+            emb.decoding.to_csv(os.path.join(cfg["outdir"], f"{bb}_decoding.csv"))
         rep.check()
         rep.phase(f"{bb}: building the views  ({n_st}/{n_st})")
-        aligned = emb._align(beh, bt, None, circ) if beh is not None else None
         color = f"beh:{next(iter(aligned))}" if aligned else "time"
         method = cfg["view_method"] if cfg["view_method"] in PROJECTIONS else "umap"
         figs = dict(
             overview=viz.dashboard(emb, behavior=aligned, circular=circ),
             embedding=_embedding_figure(emb, method, color, aligned, circ),
-            decoding=(viz.decoding_figure(emb.decoding, emb.times)
+            decoding=(viz.decoding_figure(_decoding_view(emb.decoding), emb.times)
                       if emb.decoding is not None else None),
             training=viz.training_figure(emb.history, title=f"{label(bb)} training"),
         )
         self._log_metrics(rep, met)
         res = _RunResult(emb=emb, behaviour=aligned, circular=circ, outdir=cfg["outdir"],
-                         figures=figs, metrics=met, view=(method, color))
+                         figures=figs, metrics=met, view=(method, color),
+                         gif_method=cfg["gif_method"], decoder=cfg["decoder"], cosmooth=cos)
         self._post("call", lambda: self._show_run(res))
+
+    @staticmethod
+    def _cosmooth(emb, rep):
+        """Worker: co-smoothing score of ``emb`` (bits / spike), or None.
+
+        Skipped gracefully when the input has no raw counts (continuous
+        data) or when the score cannot be computed (logged as a warning)."""
+        if emb.counts is None:
+            rep.post("log", ("co-smoothing skipped: it needs raw counts (spike times or "
+                             "non-negative integer data)", "warn"))
+            return None
+        rep.phase(f"{emb.backbone}: co-smoothing (refit on held-in neurons)")
+        old, rep.post_fit_text = rep.post_fit_text, "co-smoothing"
+        try:
+            cos = emb.cosmooth()
+        except _Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            rep.post("log", (f"co-smoothing failed: {type(exc).__name__}: {exc}", "warn"))
+            return None
+        finally:
+            rep.post_fit_text = old
+        rep.post("log", (f"co-smoothing: {float(cos['bps']):.4f} bits/spike on "
+                         f"{cos.get('n_heldout', '?')} held-out neurons, "
+                         f"{cos.get('n_test_frames', '?')} test frames", "ok"))
+        return cos
 
     @staticmethod
     def _log_metrics(rep, met):
         """Worker: one compact line with the headline metrics."""
         keys = ("n_states", "silhouette", "cluster_structure", "circularity",
-                "participation_ratio", "train_steps", "train_seconds", "total_seconds")
-        parts = [f"{k}={_fmt(met[k])}" for k in keys if k in met]
+                "participation_ratio", "cosmooth_bps", "train_steps", "train_seconds",
+                "total_seconds")
+        parts = [f"{k}={_fmt(met[k])}" for k in keys if k in met and
+                 not (isinstance(met[k], float) and not np.isfinite(met[k]))]
         rep.post("log", ("metrics: " + "  ".join(parts), "ok"))
 
     def _compare_worker(self, cfg):
-        """Worker: fit every listed backbone, write the comparison, build the grid."""
+        """Worker: fit every listed backbone, write the comparison, build the
+        embedding grid and the consistency matrix."""
+        from .viz_dynamics import consistency_figure
         bbs = cfg["compare"]
         rep = _Reporter(self._post, self._stop, bbs, "embedding, auto K and decoding")
         data = self._load_data(cfg, rep)
         s = cfg["mask_size"]
+        inputs = {"spikes": "spikes", "coco_mask": "coco_mask",
+                  "fiber_photometry": "fiber_photometry"}
         cmp = compare_embedders(
-            data["payload"], input=data["kind"], backbones=bbs, time_axis=cfg["time_axis"],
-            fs=cfg["fs"], dff=cfg["dff"], behavior=data["behavior"],
-            behavior_times=data["behavior_times"], circular=data["circular"], log=rep.log,
-            mask_resize=(s, s), mask_channel_key=cfg["mask_key"], n_perm=cfg["n_perm"],
-            bin_size=data["bin_size"], n_states=cfg["n_states"], speed=cfg["speed"],
-            objective=cfg["objective"], max_steps=cfg["max_steps"],
-            smooth_sigma=cfg["smooth"], progress=rep.progress)
+            data["payload"], input=inputs.get(data["kind"], "timeseries"), backbones=bbs,
+            time_axis=data["time_axis"], fs=data["fs"], dff=data["dff"],
+            behavior=data["behavior"], behavior_times=data["behavior_times"],
+            circular=data["circular"], log=rep.log, mask_resize=(s, s),
+            mask_channel_key=cfg["mask_key"], n_perm=cfg["n_perm"], decode_model=cfg["decoder"],
+            bin_size=data["bin_size"], progress=rep.progress, **self._embedder_kwargs(cfg))
         rep.check()
         outdir = os.path.join(cfg["outdir"], "compare")
         rep.phase("writing comparison figures and tables (UMAP of every backbone)")
         cmp.run(outdir)
         rep.check()
-        rep.phase("building the comparison grid")
+        rep.phase("building the comparison grid and the consistency matrix")
         method = cfg["cmp_method"] if cfg["cmp_method"] in PROJECTIONS else "umap"
         color = cfg["cmp_color"] if cfg["cmp_color"] in ("state", "time") else "state"
         fig = viz.compare_embeddings_figure(cmp.embedders, method=method, color=color)
+        cm = cfig = None
+        if len(cmp.embedders) >= 2:
+            try:
+                cm = cmp.consistency()
+                cfig = consistency_figure(cm)
+            except Exception as exc:  # noqa: BLE001  (optional view)
+                rep.post("log", (f"consistency matrix skipped: {type(exc).__name__}: {exc}",
+                                 "warn"))
         rep.post("log", ("\n" + cmp.metrics.round(3).to_string(index=False), None))
+        if cm is not None:
+            rep.post("log", ("consistency R² (row predicts column):\n"
+                             + cm.round(3).to_string(), None))
         best = cmp.best("silhouette")
         rep.post("log", (f"best by silhouette: {best}", "ok"))
         if cmp.decoding is not None:
             for tgt in cmp.decoding["target"].unique():
                 rep.post("log", (f"best held-out decoding of {tgt}: "
                                  f"{cmp.best('decoding:' + str(tgt))}", "ok"))
-        res = _CompareResult(cmp=cmp, outdir=outdir, figure=fig, view=(method, color))
+        res = _CompareResult(cmp=cmp, outdir=outdir, figure=fig, view=(method, color),
+                             consistency=cm, cons_figure=cfig)
         self._post("call", lambda: self._show_compare(res))
+
+    def _advise_worker(self, cfg):
+        """Worker: profile the data, build the advice, its figure and files."""
+        from .advisor import advise, profile_figure
+        rep = _Reporter(self._post, self._stop, ["advisor"], "")
+        beh = bt = columns = times = None
+        fs, time_axis = cfg["fs"], "auto"
+        if not cfg["file"]:
+            rep.phase("simulating the synthetic demo recording")
+            ds = make_dataset(seed=0)
+            payload, name = ds["spike_times"], "synthetic demo"
+            if not cfg["beh_file"]:
+                beh, bt = ds["behavior"], ds["times"]
+        else:
+            path, typ, name = cfg["file"], cfg["input_type"], os.path.basename(cfg["file"])
+            rep.phase(f"loading {name}")
+            if typ == "auto":
+                payload, hints = _data.load_auto(path)
+                columns, times = hints.get("columns"), hints.get("times")
+                fs = fs or hints.get("fs")
+            elif typ == "spikes":
+                payload = _data.load_spikes(path)
+            elif typ == "coco_mask" or (typ == "mask" and path.lower().endswith(".json")):
+                payload = path
+            else:
+                payload, time_axis = _data.load_array(path), cfg["time_axis"]
+        if cfg["beh_file"]:
+            beh, bt = _data.load_behavior(cfg["beh_file"])
+        rep.check()
+        rep.phase("profiling: value type, timescales, dimensionality, ring and cluster "
+                  "structure" + (", behaviour" if beh is not None else ""))
+        rec = advise(payload, goal=cfg["goal"], fs=fs, times=times, time_axis=time_axis,
+                     columns=columns, behavior=beh, behavior_times=bt)
+        rep.check()
+        rep.phase("drawing the profile and writing advice files")
+        fig = profile_figure(rec.profile)
+        outdir = cfg["outdir"]
+        os.makedirs(outdir, exist_ok=True)
+        rec.save(os.path.join(outdir, "advice"))
+        viz.save_figure(profile_figure(rec.profile), os.path.join(outdir, "data_profile"))
+        kw = rec.embedder_kwargs
+        rep.post("log", (f"advisor: {rec.profile.modality}, {rec.profile.n_channels} channels "
+                         f"x {rec.profile.n_frames:,} frames -> {kw.get('backbone')} via "
+                         f"{rec.fit_method} (goal {rec.goal}); profiled in "
+                         f"{rec.profile.seconds:.1f} s", "ok"))
+        for w in rec.warnings:
+            rep.post("log", (f"advisor warning: {w}", "warn"))
+        rep.post("log", (f"wrote advice.md, advice.json and data_profile.png/pdf/svg to "
+                         f"{outdir}", "muted"))
+        res = _AdviceResult(rec=rec, figure=fig, report=rec.report(),
+                            key=(cfg["file"], cfg["input_type"]), name=name, outdir=outdir)
+        self._post("call", lambda: self._show_advice(res))
 
     # ------------------------------------------- view re-render (workers) ---- #
     def _view_worker(self, emb, req, beh, circ):
@@ -2022,6 +3002,8 @@ class App:
         """Main thread: put a finished run's figures and tables on screen."""
         emb, m = res.emb, res.metrics
         self.emb, self.beh, self.circular = emb, res.behaviour, list(res.circular)
+        self.run_method = res.gif_method if res.gif_method in PROJECTIONS else "umap"
+        self.cosmooth = res.cosmooth
         self.last_outdir = res.outdir
         P = self.panes
         struct = m.get("cluster_structure", "undefined")
@@ -2031,15 +3013,24 @@ class App:
             te = emb.decoding.table[emb.decoding.table.features == "embedding"]
             cap += "  |  decoding " + ", ".join(f"{r.target} {r.score:.2f}"
                                                  for r in te.itertuples())
+        if res.cosmooth is not None:
+            bps = float(res.cosmooth["bps"])
+            cap += f"  |  co-smoothing {bps:.3f} bits/spike"
+            self._job_note = f"  |  co-smoothing {bps:.3f} bits/spike"
         P["overview"].show(res.figures["overview"], caption=cap)
         self._set_color_choices(res.behaviour, res.view[1])
         self.var_view_proj.set(res.view[0])
         P["embedding"].show(res.figures["embedding"], caption=self._embed_caption(emb, *res.view))
         if res.figures["decoding"] is not None:
             tab = emb.decoding.table
+            emb_rows = tab[tab["features"] == "embedding"]
+            extra = tab.loc[~tab["features"].isin(FIGURE_FEATURES), "features"]
+            names = sorted({FEATURE_NAMES.get(f, str(f)) for f in extra})
             P["decoding"].show(res.figures["decoding"], caption=(
-                f"{tab['target'].nunique()} targets  |  blocked {int(tab['n_folds'].max())}-fold CV"
-                f"  |  {int(tab['n_perm'].max())} circular-shift shuffles"))
+                f"{tab['target'].nunique()} targets  |  {res.decoder} decoder  |  blocked "
+                f"{int(emb_rows['n_folds'].max())}-fold CV  |  "
+                f"{int(emb_rows['n_perm'].max())} circular-shift shuffles"
+                + (f"  |  {', '.join(names)} rows in the table only" if names else "")))
             self._fill_decoding(tab)
         else:
             P["decoding"].clear("No behaviour was given, so nothing was decoded.\n"
@@ -2052,16 +3043,18 @@ class App:
         P["training"].show(res.figures["training"], caption=cap)
         for cb in (self.cb_view_proj, self.cb_view_color):
             cb.state(["!disabled"])
+        self._reset_dynamics()
         self.nb.select(P["overview"])
 
     def _fill_decoding(self, tab):
-        """Fill the Decoding table (grey rows: Holm p >= 0.05)."""
+        """Fill the Decoding table (grey rows: Holm p >= 0.05; PSID rows have
+        no permutation null, so they are never greyed and show p as 'n/a')."""
         rows, tags = [], []
         for r in tab.itertuples(index=False):
-            feats = "embedding" if r.features == "embedding" else "raw PCA"
-            rows.append((r.target, feats, r.metric, _fmt(r.score), _fmt(r.null_p95),
-                         _fmt_p(r.p_holm)))
-            ok = np.isfinite(r.p_holm) and r.p_holm < 0.05
+            psid = r.features == "psid"
+            rows.append((r.target, FEATURE_NAMES.get(r.features, str(r.features)), r.metric,
+                         _fmt(r.score), _fmt(r.null_p95), "n/a" if psid else _fmt_p(r.p_holm)))
+            ok = psid or (np.isfinite(r.p_holm) and r.p_holm < 0.05)
             tags.append([] if ok else ["nonsig"])
         self._fill_tree(self.tree_decoding, rows, tags)
 
@@ -2124,9 +3117,12 @@ class App:
                          name="nemba-cmp-view").start()
 
     def _show_cmp_view(self, cmp, req, fig):
-        """Main thread: display a re-rendered comparison grid."""
+        """Main thread: display a re-rendered comparison grid (kept for the
+        Embeddings / Consistency toggle; shown only in grid mode)."""
         if cmp is self.cmp:
-            self.panes["compare"].show(fig)
+            self._cmp_figs["grid"] = fig
+            if self.var_cmp_mode.get() == "grid":
+                self.panes["compare"].show(fig)
         self._view_done("compare")
 
     def _view_done(self, which):
@@ -2140,15 +3136,21 @@ class App:
             self._set_status(text, dot=dot, error=status == "error")
         pending, self._view_pending[which] = self._view_pending[which], None
         if pending is not None:
-            (self._on_view_change if which == "embedding" else self._on_cmp_view_change)()
+            {"embedding": self._on_view_change, "compare": self._on_cmp_view_change,
+             "dynamics": self._on_dyn_change}[which]()
 
     def _show_compare(self, res):
         """Main thread: put a finished comparison on the Compare tab."""
         cmp = res.cmp
         self.cmp = cmp
         self.last_outdir = res.outdir
-        self.panes["compare"].show(res.figure, caption=(
-            f"{len(cmp.embedders)} backbones  |  {_short_path(res.outdir, 2)}"))
+        self._cmp_figs = {"grid": res.figure, "consistency": res.cons_figure}
+        self._cmp_caption = f"{len(cmp.embedders)} backbones  |  {_short_path(res.outdir, 2)}"
+        self.var_cmp_mode.set("grid")
+        self.rb_cmp_mode["grid"].state(["!disabled"])
+        self.rb_cmp_mode["consistency"].state(
+            ["!disabled"] if res.cons_figure is not None else ["disabled"])
+        self.panes["compare"].show(res.figure, caption=self._cmp_caption)
         self._fill_dataframe(self.tree_cmp_metrics, cmp.metrics)
         piv = cmp.decoding_table()
         if piv is not None and len(piv):
@@ -2162,6 +3164,131 @@ class App:
         for cb in (self.cb_cmp_proj, self.cb_cmp_color):
             cb.state(["!disabled"])
         self.nb.select(self.tab_compare)
+
+    def _on_cmp_mode(self):
+        """Embeddings / Consistency toggle of the Compare tab (cached figures)."""
+        mode = self.var_cmp_mode.get()
+        fig = self._cmp_figs.get(mode)
+        if self.cmp is None or fig is None:
+            return
+        pane = self.panes["compare"]
+        if mode == "consistency":
+            pane.show(fig, caption="cross-validated R² of a linear map, row predicts "
+                                   "column  |  " + _short_path(self.last_outdir or "", 2))
+        else:
+            pane.show(fig, caption=self._cmp_caption)
+        # projection and colour only apply to the embedding grid
+        for cb in (self.cb_cmp_proj, self.cb_cmp_color):
+            cb.state(["!disabled"] if mode == "grid" else ["disabled"])
+
+    # ------------------------------------------------------------ dynamics -- #
+    def _reset_dynamics(self):
+        """New run: forget cached Dynamics figures and list the available ones."""
+        self._dyn_cache, self._dyn_shown = {}, None
+        self._dyn_map = _dynamics_choices(self.emb, self.beh, self.circular)
+        names = list(self._dyn_map)
+        self.cb_dyn.configure(values=names)
+        if self.var_dyn_fig.get() not in names:
+            self.var_dyn_fig.set(names[0])
+        self.cb_dyn.state(["!disabled"])
+        self.panes["dynamics"].clear("Rendering on demand: open this tab or pick a figure.")
+        self.tree_dyn.delete(*self.tree_dyn.get_children(""))
+        self.lbl_dyn_help.configure(text="")
+        if self._current_tab() is self.tab_dynamics:
+            self._on_dyn_change()
+
+    def _current_tab(self):
+        """Widget of the selected notebook tab (None if unavailable)."""
+        try:
+            return self.nb.nametowidget(self.nb.select())
+        except (KeyError, tk.TclError):
+            return None
+
+    def _on_tab_changed(self, _event=None):
+        """Render the selected Dynamics figure when its tab is opened."""
+        if (self._current_tab() is self.tab_dynamics and self.emb is not None
+                and self._dyn_shown != self.var_dyn_fig.get()):
+            self._on_dyn_change()
+
+    def _on_dyn_change(self, _event=None):
+        """Dynamics figure selected: show it from the cache or build it in a worker."""
+        if self.emb is None:
+            return
+        name = self.var_dyn_fig.get()
+        if name not in self._dyn_map:
+            return
+        if name in self._dyn_cache:
+            self._show_dyn(self.emb, name, *self._dyn_cache[name], cached=True)
+            return
+        if self._view_busy["dynamics"]:
+            self._view_pending["dynamics"] = name
+            return
+        self._view_busy["dynamics"] = True
+        self.panes["dynamics"].clear(f"Computing '{name}'...")
+        if not self.busy:
+            self._set_status(f"Computing the {name.lower()} figure...", dot="run")
+            self._progress_indeterminate()
+        kind, beh_name = self._dyn_map[name]
+        threading.Thread(target=self._dyn_worker,
+                         args=(self.emb, name, kind, beh_name, self.beh, list(self.circular),
+                               self.run_method),
+                         daemon=True, name="nemba-dynamics").start()
+
+    def _dyn_worker(self, emb, name, kind, beh_name, beh, circ, method):
+        """Worker: build one Dynamics figure and its statistics."""
+        try:
+            fig, rows, cap = _dynamics_figure(emb, kind, beh_name, beh, circ, method)
+            self._post("call", lambda: self._show_dyn(emb, name, fig, rows, cap))
+        except Exception as exc:  # noqa: BLE001
+            msg, tb = f"{type(exc).__name__}: {exc}", traceback.format_exc()
+            self._post("error", (f"dynamics view ({name}): {msg}", tb))
+
+            def _failed():
+                """Main thread: explain the failure in the pane, release the view slot."""
+                if emb is self.emb:
+                    self.panes["dynamics"].clear(f"'{name}' could not be drawn:\n{msg}")
+                self._view_done("dynamics")
+            self._post("call", _failed)
+
+    def _show_dyn(self, emb, name, fig, rows, cap, cached=False):
+        """Main thread: display a Dynamics figure, its statistics and reading guide."""
+        if emb is self.emb:
+            self._dyn_cache[name] = (fig, rows, cap)
+            if self.var_dyn_fig.get() == name:
+                self.panes["dynamics"].show(fig, caption=cap)
+                self._dyn_shown = name
+                self._fill_tree(self.tree_dyn, [(k, _fmt(v)) for k, v in rows])
+                kind = self._dyn_map.get(name, ("", None))[0]
+                self.lbl_dyn_help.configure(text=DYN_HELP.get(kind, ""))
+        if not cached:
+            self._view_done("dynamics")
+
+    # ------------------------------------------------------------- advisor -- #
+    def _advice_caption(self):
+        """One-line summary of the recommendation shown above the report."""
+        rec = self.rec
+        kw = rec.embedder_kwargs
+        extra = self._advice_extra()
+        parts = [f"goal {rec.goal}", f"{kw.get('backbone')} ({kw.get('speed')})",
+                 f"compare {', '.join(rec.compare)}"]
+        if rec.warnings:
+            parts.append(f"{len(rec.warnings)} warning{'s' if len(rec.warnings) > 1 else ''}")
+        # (what "Run suggested" adds beyond the sidebar is written to the log)
+        return "  |  ".join(parts)
+
+    def _show_advice(self, res):
+        """Main thread: show the profile figure and the formatted advice."""
+        from .advisor import MODALITIES
+        self.rec, self._rec_key = res.rec, res.key
+        self.last_outdir = res.outdir
+        p = res.rec.profile
+        self.panes["advisor"].show(res.figure, caption=(
+            f"{res.name}  |  {MODALITIES.get(p.modality, p.modality)}  |  {p.n_channels} ch x "
+            f"{p.n_frames:,} frames  |  profiled in {p.seconds:.1f} s"))
+        self.report.set_markdown(res.report)
+        self._refresh_advice_buttons()
+        self._on_data_change()                       # the File hint names the modality
+        self.nb.select(self.tab_advisor)
 
     # ------------------------------------------------------------- utilities --
     def style_toolbar(self, tb):

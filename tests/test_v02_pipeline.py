@@ -70,6 +70,12 @@ def test_overlap_add_embedding_has_no_seams_for_framewise_model():
 
 @pytest.mark.parametrize("name", list_backbones())
 def test_every_backbone_trains_and_embeds(name):
+    # optional backbones: skip when their module / package is not available
+    if name == "gpfa":
+        pytest.importorskip("embedders_backbones.gpfa")
+    if name == "cebra":
+        pytest.importorskip("cebra")
+        pytest.importorskip("embedders_backbones.integrations")
     rng = np.random.default_rng(0)
     X = rng.standard_normal((6, 160)).astype(np.float32)
     kw = dict(d_model=16, num_heads=2, hidden_size=16, conv_channels=16, dilations=(1, 2),
@@ -166,7 +172,8 @@ def test_embedder_decodes_ground_truth_and_roundtrips(tmp_path, small_dataset):
     emb_rows = tab[tab.features == "embedding"].set_index("target")
     assert emb_rows.loc["state", "score"] > 0.6
     assert emb_rows.loc["phase", "score"] > 0.5
-    assert set(tab.features) == {"embedding", "raw_pca"}
+    # spikes carry raw counts, so the Bayesian count decoder rows come too
+    assert set(tab.features) == {"embedding", "raw_pca", "bayes_counts"}
     p = emb.save(os.path.join(tmp_path, "enc.pt"))
     emb2 = Embedder.load(p, log=None)
     assert np.allclose(emb2.transform(emb.X_input), emb.Z, atol=1e-4)

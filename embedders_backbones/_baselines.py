@@ -67,3 +67,30 @@ class PCABaseline(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> NeuralEmbTCNOutput:
         return NeuralEmbTCNOutput(embeddings=self.encode(x, mask))
+
+
+class FactorAnalysisBaseline(PCABaseline):
+    """Factor analysis: like PCA but with a separate noise variance per channel
+    (Cunningham & Yu, Nat Neurosci 2014). The embedding is the posterior mean of
+    the factors, E[z | x] = (I + L' Psi^-1 L)^-1 L' Psi^-1 (x - mu), which is a
+    fixed linear map, so it is also implemented as a 1x1 convolution."""
+
+    def fit_numpy(self, X: np.ndarray) -> "FactorAnalysisBaseline":
+        """Fit factors on X [C, T] and load the posterior-mean map."""
+        from sklearn.decomposition import FactorAnalysis
+        X = np.asarray(X, dtype=np.float64)
+        fa = FactorAnalysis(n_components=self.k, random_state=0).fit(X.T)
+        Lam = fa.components_.T                                    # [C, k]
+        psi_inv = 1.0 / np.maximum(fa.noise_variance_, 1e-6)      # [C]
+        A = np.eye(self.k) + (Lam.T * psi_inv) @ Lam              # [k, k]
+        W = np.linalg.solve(A, Lam.T * psi_inv)                   # [k, C]
+        mu = fa.mean_
+        total = (Lam ** 2).sum() + fa.noise_variance_.sum()
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.from_numpy(W[:, :, None]).float())
+            self.proj.bias.copy_(torch.from_numpy(-(W @ mu)).float())
+            # share of the total variance carried by each factor
+            self.explained_variance_ratio.copy_(torch.from_numpy(
+                (Lam ** 2).sum(0) / max(total, 1e-12)).float())
+        self.noise_variance_ = fa.noise_variance_
+        return self

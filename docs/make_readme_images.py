@@ -74,7 +74,12 @@ def figures(ds, tmp):
                      (f"{p}_decoding.png", "fig_decoding.png"),
                      (f"{p}_states.png", "fig_states.png"),
                      (f"{p}_state_dynamics.png", "fig_state_dynamics.png"),
-                     (f"{p}_training.png", "fig_training.png")]:
+                     (f"{p}_training.png", "fig_training.png"),
+                     (f"{p}_topology.png", "fig_topology.png"),
+                     (f"{p}_flow_field.png", "fig_flow_field.png"),
+                     (f"{p}_recurrence.png", "fig_recurrence.png"),
+                     (f"{p}_rastermap.png", "fig_rastermap.png"),
+                     (f"{p}_contingency_state.png", "fig_contingency.png")]:
         copy(out, src, dst)
     viz.trajectory_gif(emb.Z, os.path.join(IMG, "trajectory.gif"), method="umap",
                        projection=emb.projection("umap"), states=emb.states,
@@ -92,6 +97,26 @@ def figures(ds, tmp):
         print("  (Chrome not found: explorer screenshot skipped)")
 
 
+def advisor_figures(ds, tmp):
+    """Data-profile figure, advice report and a T-PHATE vs PCA projection."""
+    from embedders_backbones.advisor import advise, profile_figure
+    rec = advise(ds["spike_times"], behavior=ds["behavior"], behavior_times=ds["times"])
+    viz.save_figure(profile_figure(rec.profile), os.path.join(IMG, "fig_data_profile"), ("png",))
+    with open(os.path.join(IMG, "advice_example.md"), "w", encoding="utf-8") as fh:
+        fh.write(rec.report())
+    print("  wrote fig_data_profile.png, advice_example.md")
+    emb = Embedder("tcn", speed=SPEED, bin_size=ds["dt"], seed=SEED, log=None)
+    emb.fit_spikes(ds["spike_times"])
+    beh = emb._align(ds["behavior"], ds["times"], None, ["phase"])
+    fig = emb.figure(methods=("pca", "tphate"), color="behavior", behavior=beh["phase"],
+                     behavior_name="phase", circular=True)
+    viz.save_figure(fig, os.path.join(IMG, "fig_tphate"), ("png",))
+    fig = emb.figure(methods=("pca", "tphate"), color="behavior", behavior=beh["state"],
+                     behavior_name="true state")
+    viz.save_figure(fig, os.path.join(IMG, "fig_tphate_states"), ("png",))
+    print("  wrote fig_tphate.png, fig_tphate_states.png")
+
+
 def comparison(ds, tmp):
     """Comparison figures (embeddings grid, state rasters, decoding bars)."""
     cmp = compare_embedders(ds["spike_times"], input="spikes", backbones=COMPARE,
@@ -102,7 +127,8 @@ def comparison(ds, tmp):
     for src, dst in [("compare_embeddings.png", "cmp_embeddings.png"),
                      ("compare_state_sequences.png", "cmp_state_sequences.png"),
                      ("compare_decoding_speed.png", "cmp_decoding_speed.png"),
-                     ("compare_train_seconds.png", "cmp_train_seconds.png")]:
+                     ("compare_train_seconds.png", "cmp_train_seconds.png"),
+                     ("compare_consistency.png", "cmp_consistency.png")]:
         copy(out, src, dst)
 
 
@@ -146,6 +172,11 @@ def gui_screenshots(tmp):
     app.var_speed.set(SPEED); app.var_max_steps.set(""); app.var_states.set("auto")
     app.var_out.set(os.path.join(tmp, "gui_run"))
     app.var_gif.set(False); app.var_html.set(True)
+    app.analyse()                                   # advisor on the demo data
+    if not pump(root, lambda: not app.busy, 600):
+        raise RuntimeError("GUI analyse did not finish")
+    shoot(root, app, app.tab_advisor, "gui_advisor.png")
+    app.set_backbone(BACKBONE)
     app.run()
     if not pump(root, lambda: not app.busy, 900):
         raise RuntimeError("GUI run did not finish")
@@ -155,6 +186,11 @@ def gui_screenshots(tmp):
                       ("gui_training.png", app.panes["training"]),
                       ("gui_log.png", app.tab_log)):
         shoot(root, app, tab, name)
+    app.var_dyn_fig.set("Flow field")               # dynamics tab, flow field figure
+    app.nb.select(app.tab_dynamics)
+    app._on_dyn_change()
+    pump(root, lambda: getattr(app, "_dyn_shown", None) == "Flow field", 300)
+    shoot(root, app, app.tab_dynamics, "gui_dynamics.png")
     app.var_compare.set(GUI_COMPARE)
     app.var_max_steps.set("150")
     app.compare()
@@ -171,6 +207,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         if "--no-single" not in sys.argv:
             print("single-backbone figures ..."); figures(ds, tmp)
+        if "--no-advisor" not in sys.argv:
+            print("advisor figures ..."); advisor_figures(ds, tmp)
         if "--no-compare" not in sys.argv:
             print("comparison figures ..."); comparison(ds, tmp)
         if "--no-gui" not in sys.argv:

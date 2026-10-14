@@ -11,8 +11,10 @@ with time-series-aware decoding and visualisation. CPU-first.
 from .core import Embedder
 from .compare import compare_embedders, Comparison
 from .backbones import list_backbones, label, make_model, BACKBONES
-from .training import SPEED_PRESETS, OBJECTIVES
-from . import data, analysis, backbones, compare, decoding, training, synthetic
+from .training import SPEED_PRESETS, OBJECTIVES, LIKELIHOODS, MASK_MODES
+from .advisor import advise, analyze_data, suggest
+from .cosmoothing import cosmooth_score
+from . import data, analysis, backbones, compare, decoding, training, synthetic, advisor
 
 
 def __getattr__(name):
@@ -24,6 +26,8 @@ def __getattr__(name):
 
 
 __all__ = ["Embedder", "compare_embedders", "Comparison", "list_backbones", "label",
-           "make_model", "BACKBONES", "SPEED_PRESETS", "OBJECTIVES", "data", "analysis",
-           "viz", "backbones", "compare", "decoding", "training", "synthetic"]
-__version__ = "0.2.0"
+           "make_model", "BACKBONES", "SPEED_PRESETS", "OBJECTIVES", "LIKELIHOODS",
+           "MASK_MODES", "advise", "analyze_data", "suggest", "cosmooth_score", "data",
+           "analysis", "viz", "backbones", "compare", "decoding", "training", "synthetic",
+           "advisor"]
+__version__ = "0.3.0"

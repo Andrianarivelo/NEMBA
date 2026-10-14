@@ -102,6 +102,22 @@ Counter-arguments worth keeping in mind:
 6. **Tier 2:** PSID, GPFA, cross-session alignment, gradient-boosting and Bayesian
    decoders, circular readout, T-PHATE, 3-D explorer.
 
+## 6. Implementation status (after this review)
+
+| item | status | where | measured outcome |
+|---|---|---|---|
+| Poisson likelihood, neuron / both masking | done | `training.py` (`likelihood`, `mask_mode`) | no significant gain over the default on synthetic data (`benchmarks/results/objectives_*`); leaning towards better state recovery |
+| co-smoothing (bits/spike) | done | `cosmoothing.py`, `Embedder.cosmooth()` | PCA / FA score highest on the synthetic benchmark |
+| sticky HMM / AR-HMM states, K by held-out likelihood | done | `states.py`, `state_model=` | see `benchmarks/results/states_validation.*` |
+| factor analysis, GPFA (native), CEBRA wrapper | done | `_baselines.py`, `gpfa.py`, `integrations.py` | GPFA recovers simulated latents (R^2 > 0.99) and timescales (within 6 %) |
+| PSID (cross-fitted) decoding rows | done | `integrations.py`, `decode(psid=True)` | R^2 0.94 on a simulated behaviour-specific subspace |
+| gradient boosting, Bayesian count decoder | done | `decoding.py` | gbm R^2 0.82 where linear fails on a non-linear target |
+| cross-session alignment, consistency | done | `align.py`, `Comparison.consistency()` | CCA robust to anisotropic stretch where Procrustes fails |
+| persistence barcode, flow field, recurrence, Rastermap, contingency | done | `viz_dynamics.py`, `Embedder.run(dynamics=True)` | each figure carries a null reference |
+| T-PHATE projection, 3-D explorer | done | `manifold.py`, explorer `view=3d` | native re-implementation; emphasises slow structure (separates states: 2-D silhouette 0.49 vs 0.02 for PCA) and blurs the faster ring |
+| data advisor (profile -> recommendation) | done | `advisor.py`, `Embedder.auto`, `--advise` | 80/80 on 4 checks over 8 synthetic kinds x 10 seeds |
+| LFADS, MARBLE, DSA, pretrained foundation models | not done | external | GPU-oriented; import their latents |
+
 ## References
 
 Journal articles (verified in PubMed; DOI links):

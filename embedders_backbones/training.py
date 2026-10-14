@@ -11,6 +11,20 @@ Objectives
                  frame in the batch is a negative.
 ``hybrid``       ``masked + contrastive_weight * contrastive``.
 
+Masking (``mask_mode``) and likelihood (``likelihood``)
+--------------------------------------------------------
+``time``    hide contiguous spans of frames (all channels): learn temporal context.
+``neuron``  hide a random subset of channels for the whole window: learn to
+            predict a neuron from the others at the same time (population
+            structure; the in-model analogue of co-smoothing, Pei et al. 2021).
+``both``    alternate time and neuron masking from step to step (multi-task
+            masking, Zhang et al. NeurIPS 2024).
+``gaussian`` squared error on the z-scored input (any modality).
+``poisson``  Poisson negative log-likelihood on raw counts (spikes): the head
+             predicts the log-rate modulation around each neuron's mean rate
+             (LFADS / NDT / Neural Latents Benchmark use Poisson for spikes).
+             Validation then also reports bits per spike on held-out time.
+
 Speed (why it is fast without a GPU)
 ------------------------------------
 * a fixed optimisation *step budget* instead of epochs, so cost does not grow
@@ -100,6 +114,51 @@ def apply_input_mask(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return x.masked_fill(mask[:, None, :], 0.0)
 
 
+LIKELIHOODS = ("gaussian", "poisson")
+MASK_MODES = ("time", "neuron", "both")
+
+
+def make_element_mask(B, C, L, mode, ratio=0.4, span=16, neuron_frac=0.25,
+                      generator=None, device=None):
+    """Element mask [B, C, L] (True = hidden) and frame mask [B, L] or None.
+
+    ``time``: spans of frames hidden on every channel (frame mask returned so
+    models with a learned mask token can use it). ``neuron``: a random subset
+    of ``neuron_frac`` of the channels hidden for the whole window (no frame
+    mask). ``both``: one of the two, drawn at random for this batch. With a
+    single channel neuron masking is impossible and time masking is used."""
+    if mode == "both":
+        mode = "time" if float(torch.rand(1, generator=generator)) < 0.5 else "neuron"
+    if mode == "neuron" and C >= 2:
+        k = int(min(C - 1, max(1, round(neuron_frac * C))))
+        order = torch.rand(B, C, generator=generator).argsort(dim=1)[:, :k]
+        cm = torch.zeros(B, C, dtype=torch.bool)
+        cm.scatter_(1, order, True)
+        em = cm[:, :, None].expand(B, C, L)
+        return (em.to(device) if device is not None else em), None
+    fm = make_span_mask(B, L, ratio, span, generator=generator)
+    em = fm[:, None, :].expand(B, C, L)
+    if device is not None:
+        em, fm = em.to(device), fm.to(device)
+    return em, fm
+
+
+def masked_element_loss(target, recon, elem_mask, likelihood="gaussian", log_rate_offset=None):
+    """Mean loss over hidden elements.
+
+    gaussian: squared error between recon and the z-scored target.
+    poisson : exp(r) - y * r with r = recon + log(mean rate) (constant terms
+              in y are dropped; they do not depend on the model)."""
+    m = elem_mask.to(recon.dtype)
+    if likelihood == "poisson":
+        r = recon if log_rate_offset is None else recon + log_rate_offset
+        r = r.clamp(-12.0, 12.0)
+        nll = torch.exp(r) - target * r
+    else:
+        nll = (target - recon) ** 2
+    return (nll * m).sum() / m.sum().clamp_min(1.0)
+
+
 def time_contrastive_loss(z: torch.Tensor, *, n_pairs: int = 8, max_offset: int = 10,
                           temperature: float = 0.2, generator=None) -> torch.Tensor:
     """Symmetric InfoNCE over time-offset positive pairs.
@@ -126,17 +185,31 @@ def time_contrastive_loss(z: torch.Tensor, *, n_pairs: int = 8, max_offset: int 
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
 
-def _objective_loss(net, xb, mask, cfg, generator):
-    """One forward pass + the requested loss (plus any model auxiliary loss)."""
+def _objective_loss(net, xb, yb, cfg, generator, mask_mode=None, return_parts=False):
+    """One forward pass + the requested loss (plus any model auxiliary loss).
+
+    xb: model input windows [B, C, L] (z-scored); yb: raw-count windows for the
+    Poisson likelihood (None for gaussian). With ``return_parts`` the hidden
+    elements, targets and log-rates are also returned (for bits/spike)."""
     obj = cfg["objective"]
+    parts = None
     if obj == "contrastive":
         out = net(xb, None)
         loss = time_contrastive_loss(out.embeddings, n_pairs=cfg["n_pairs"],
                                      max_offset=cfg["contrastive_offset"],
                                      temperature=cfg["temperature"], generator=generator)
     else:
-        out = net(apply_input_mask(xb, mask), mask)
-        loss = masked_reconstruction_loss(xb, out.reconstruction, mask)
+        B, C, L = xb.shape
+        em, fm = make_element_mask(B, C, L, mask_mode or cfg["mask_mode"], cfg["mask_ratio"],
+                                   cfg["mask_span"], cfg["neuron_frac"], generator, xb.device)
+        out = net(xb.masked_fill(em, 0.0), fm)
+        poisson = cfg["likelihood"] == "poisson"
+        target = yb if poisson else xb
+        loss = masked_element_loss(target, out.reconstruction, em, cfg["likelihood"],
+                                   cfg.get("log_rate_offset") if poisson else None)
+        if return_parts and poisson:
+            r = (out.reconstruction + cfg["log_rate_offset"]).clamp(-12.0, 12.0)
+            parts = (em, yb, r)
         if obj == "hybrid":
             loss = loss + cfg["contrastive_weight"] * time_contrastive_loss(
                 out.embeddings, n_pairs=cfg["n_pairs"], max_offset=cfg["contrastive_offset"],
@@ -144,7 +217,7 @@ def _objective_loss(net, xb, mask, cfg, generator):
     aux = getattr(out, "aux_loss", None)
     if aux is not None:
         loss = loss + aux
-    return loss
+    return (loss, parts) if return_parts else loss
 
 
 # --------------------------------------------------------------------------- #
@@ -185,12 +258,15 @@ def split_train_val(T, L, val_frac):
     return (0, T - n_val), (T - n_val, T)
 
 
-def _sample_windows(Xt, seg, L, B, generator):
-    """B random crops of length L from segment [s0, s1) of Xt [C, T] -> [B, C, L]."""
+def _sample_windows(Xt, seg, L, B, generator, Yt=None):
+    """B random crops of length L from segment [s0, s1) of Xt [C, T] -> [B, C, L]
+    (and the same crops of Yt when given)."""
     s0, s1 = seg
     starts = torch.randint(s0, s1 - L + 1, (B,), generator=generator)
     idx = (starts[:, None] + torch.arange(L)).to(Xt.device)
-    return Xt[:, idx].permute(1, 0, 2).contiguous()
+    xb = Xt[:, idx].permute(1, 0, 2).contiguous()
+    yb = Yt[:, idx].permute(1, 0, 2).contiguous() if Yt is not None else None
+    return xb, yb
 
 
 def _val_batches(Xt, seg, L, max_windows=64):
@@ -209,8 +285,12 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
           mask_ratio=0.4, mask_span=16, objective="masked", contrastive_weight=0.5,
           temperature=0.2, contrastive_offset=10, n_pairs=8, val_frac=0.1,
           eval_every=None, patience=None, device="auto", seed=0, log=print,
-          model_kwargs=None, n_threads=None, time_budget_s="preset", progress=None):
+          model_kwargs=None, n_threads=None, time_budget_s="preset", progress=None,
+          likelihood="gaussian", mask_mode="time", neuron_frac=0.25, counts=None):
     """Train backbone ``name`` on X [C, T] (z-scored). Returns (net, history).
+
+    ``likelihood="poisson"`` needs ``counts`` [C, T] (raw spike counts aligned
+    with X); ``mask_mode`` is "time", "neuron" or "both" (see module docstring).
 
     ``history`` holds the loss curves (``step``, ``train_loss``, ``val_loss``),
     ``best_step``, ``stopped_early``, ``seconds`` and the resolved settings.
@@ -220,6 +300,12 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
     """
     if objective not in OBJECTIVES:
         raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
+    if likelihood not in LIKELIHOODS:
+        raise ValueError(f"likelihood must be one of {LIKELIHOODS}, got {likelihood!r}")
+    if mask_mode not in MASK_MODES:
+        raise ValueError(f"mask_mode must be one of {MASK_MODES}, got {mask_mode!r}")
+    if likelihood == "poisson" and counts is None:
+        raise ValueError("likelihood='poisson' needs the raw counts (counts=[C, T])")
     s = resolve_settings(speed, max_steps=max_steps, win_len=win_len, batch=batch,
                          eval_every=eval_every, patience=patience)
     if time_budget_s == "preset":                    # None = explicitly no cap
@@ -243,7 +329,9 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
     history = dict(step=[], train_loss=[], val_loss=[], lr=[], best_step=0,
                    best_val=float("nan"), stopped_early=False, steps_done=0,
                    seconds=0.0, objective=objective, win_len=L, batch=s["batch"],
-                   speed=speed, n_params=int(sum(p.numel() for p in net.parameters())))
+                   speed=speed, n_params=int(sum(p.numel() for p in net.parameters())),
+                   likelihood=likelihood, mask_mode=mask_mode, val_bps=[],
+                   best_val_bps=float("nan"))
 
     # --- no-training baselines (e.g. PCA) fit in closed form --------------- #
     if not getattr(net, "trainable", True):
@@ -272,8 +360,25 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
     gen = torch.Generator().manual_seed(seed)
     val_x = _val_batches(Xt, val_seg, L) if val_seg is not None else None
 
+    poisson = likelihood == "poisson"
+    Yt = val_y = log_rate = None
+    if poisson:
+        Y = np.ascontiguousarray(counts, dtype=np.float32)
+        if Y.shape != X.shape:
+            raise ValueError(f"counts shape {Y.shape} != X shape {X.shape}")
+        Yt = torch.from_numpy(Y).to(dev)
+        # mean rate per channel on the training segment: Poisson offset + null model
+        mean_rate = Yt[:, train_seg[0]:train_seg[1]].mean(dim=1).clamp_min(1e-4)
+        log_rate = mean_rate.log().view(1, C, 1)
+        val_y = _val_batches(Yt, val_seg, L) if val_seg is not None else None
+
     cfg = dict(objective=objective, contrastive_weight=contrastive_weight,
-               temperature=temperature, contrastive_offset=contrastive_offset, n_pairs=n_pairs)
+               temperature=temperature, contrastive_offset=contrastive_offset, n_pairs=n_pairs,
+               likelihood=likelihood, mask_mode=mask_mode, neuron_frac=neuron_frac,
+               mask_ratio=mask_ratio, mask_span=mask_span, log_rate_offset=log_rate)
+    # validation always uses the same masking: neuron masks (co-smoothing
+    # proxy) whenever neurons are masked in training, otherwise time spans
+    val_mode = "neuron" if (mask_mode in ("neuron", "both") and C >= 2) else "time"
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
     warm = max(1, int(0.05 * steps))
 
@@ -286,27 +391,38 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
 
     def validate():
+        """Validation loss (and bits/spike for Poisson) with fixed masks."""
         if val_x is None:
-            return float("nan")
+            return float("nan"), float("nan")
         net.eval()
         vgen = torch.Generator().manual_seed(seed + 12345)   # identical masks / pairs each time
         tot, n = 0.0, 0
+        nll_model = nll_null = n_spk = 0.0
         with torch.no_grad():
             for i in range(0, val_x.shape[0], B):
                 xb = val_x[i:i + B]
-                m = make_span_mask(xb.shape[0], L, mask_ratio, mask_span, device=dev, generator=vgen)
-                tot += float(_objective_loss(net, xb, m, cfg, vgen)) * xb.shape[0]
+                yb = val_y[i:i + B] if val_y is not None else None
+                loss, parts = _objective_loss(net, xb, yb, cfg, vgen, mask_mode=val_mode,
+                                              return_parts=True)
+                tot += float(loss) * xb.shape[0]
                 n += xb.shape[0]
+                if parts is not None:                    # bits per spike on hidden entries
+                    em, y, r = parts
+                    m = em.float()
+                    lam0 = log_rate.exp().expand_as(r)
+                    nll_model += float(((torch.exp(r) - y * r) * m).sum())
+                    nll_null += float(((lam0 - y * log_rate) * m).sum())
+                    n_spk += float((y * m).sum())
         net.train()
-        return tot / max(n, 1)
+        bps = (nll_null - nll_model) / (n_spk * math.log(2)) if n_spk > 0 else float("nan")
+        return tot / max(n, 1), bps
 
     best_state, best_val, bad = None, float("inf"), 0
     run_loss, run_n = 0.0, 0
     net.train()
     for step in range(steps):
-        xb = _sample_windows(Xt, train_seg, L, B, gen)
-        mask = make_span_mask(B, L, mask_ratio, mask_span, device=dev, generator=gen)
-        loss = _objective_loss(net, xb, mask, cfg, gen)
+        xb, yb = _sample_windows(Xt, train_seg, L, B, gen, Yt)
+        loss = _objective_loss(net, xb, yb, cfg, gen)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
@@ -317,19 +433,22 @@ def train(name, X, *, embedding_dim=32, speed="fast", max_steps=None, epochs=Non
         last = step == steps - 1
         out_of_time = time_budget_s is not None and time.perf_counter() - t_start > time_budget_s
         if (step + 1) % eval_every == 0 or last or out_of_time:
-            v = validate()
+            v, vbps = validate()
             tr = run_loss / max(run_n, 1); run_loss, run_n = 0.0, 0
             history["step"].append(step + 1); history["train_loss"].append(tr)
             history["val_loss"].append(v); history["lr"].append(opt.param_groups[0]["lr"])
+            history["val_bps"].append(vbps)
             if progress:
                 progress(step + 1, steps, tr, v)
             if log:
                 vs = "" if math.isnan(v) else f"  val={v:.4f}"
-                log(f"  step {step + 1:5d}/{steps}  loss={tr:.4f}{vs}")
+                bs = "" if math.isnan(vbps) else f"  val_bps={vbps:.3f}"
+                log(f"  step {step + 1:5d}/{steps}  loss={tr:.4f}{vs}{bs}")
             if not math.isnan(v):
                 if v < best_val - 1e-3 * abs(best_val if np.isfinite(best_val) else 1.0):
                     best_val, bad = v, 0
                     history["best_step"] = step + 1
+                    history["best_val_bps"] = vbps
                     best_state = {k: t.detach().clone() for k, t in net.state_dict().items()}
                 else:
                     bad += 1
@@ -373,6 +492,11 @@ def embed_sequence(net, X, emb_dim=None, win_len=256, device="auto", batch=None,
     dev = resolve_device(device)
     net.eval()
     X = np.ascontiguousarray(X, dtype=np.float32)
+    if hasattr(net, "transform_numpy"):              # whole-sequence models (CEBRA, GPFA)
+        Z = np.asarray(net.transform_numpy(X), dtype=np.float32)
+        if normalize:
+            Z = Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-8)
+        return Z
     C, T = X.shape
     L = int(min(win_len, T))
     pad_to = None

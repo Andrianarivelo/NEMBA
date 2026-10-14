@@ -117,8 +117,23 @@ class Comparison:
         beh = first._align(self.behavior, self.behavior_times, None, self.circular)
         return next(iter(beh.items()))
 
+    def consistency(self):
+        """Pairwise linear consistency (cross-validated R^2 of a linear map
+        between embeddings; row predicts column), as in CEBRA."""
+        from .align import consistency_matrix
+        return consistency_matrix({bb: e.embedding() for bb, e in self.embedders.items()})
+
     def run(self, outdir, behavior=None, formats=None):
         os.makedirs(outdir, exist_ok=True)
+        if len(self.embedders) >= 2:
+            try:
+                from .viz_dynamics import consistency_figure
+                cm = self.consistency()
+                cm.to_csv(os.path.join(outdir, "comparison_consistency.csv"))
+                _viz.save_figure(consistency_figure(cm), os.path.join(outdir, "compare_consistency"),
+                                 formats)
+            except Exception:  # noqa: BLE001  (optional figure)
+                pass
         self.metrics.to_csv(os.path.join(outdir, "comparison_metrics.csv"), index=False)
         self.plot_embeddings(os.path.join(outdir, "compare_embeddings"), formats=formats)
         self.plot_state_sequences(os.path.join(outdir, "compare_state_sequences"),

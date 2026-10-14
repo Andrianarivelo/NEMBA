@@ -1,0 +1,6 @@
+true_modality,binned_counts,calcium,photometry,pose,spike_times
+binned_counts,40,0,0,0,0
+calcium,0,10,0,0,0
+photometry,0,0,10,0,0
+pose,0,0,0,10,0
+spike_times,0,0,0,0,10

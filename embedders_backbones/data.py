@@ -447,6 +447,102 @@ def load_array(path: str) -> np.ndarray:
     return np.load(path, allow_pickle=False)
 
 
+DLC_PCUTOFF = 0.6        # DeepLabCut likelihood below which a keypoint is set to NaN
+_TIME_KEYS = ("time", "times", "timestamp", "timestamps", "t", "frame_times")
+
+
+def _fs_from_times(t):
+    t = np.asarray(t, float)
+    d = np.diff(t[np.isfinite(t)])
+    return float(1.0 / np.median(d)) if d.size and np.median(d) > 0 else None
+
+
+def load_dlc_csv(path: str, pcutoff: float = DLC_PCUTOFF):
+    """Read a DeepLabCut CSV (3 header rows: scorer / bodyparts / coords).
+
+    Returns (X [T, 2K] with x/y per body part, column names '<part>_x',
+    '<part>_y'); points with likelihood < ``pcutoff`` become NaN (multi-animal
+    files with an extra 'individuals' row are also handled)."""
+    import pandas as pd
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        head = [fh.readline() for _ in range(4)]
+    n_header = 4 if head[1].lower().startswith("individuals") else 3
+    df = pd.read_csv(path, header=list(range(n_header)), index_col=0)
+    cols, names = [], []
+    levels = df.columns.nlevels
+    parts = []
+    for c in df.columns:
+        key = tuple(c[1:levels - 1])                 # (bodypart,) or (individual, bodypart)
+        if key not in parts:
+            parts.append(key)
+    for key in parts:
+        sub = {c[-1]: df[c].to_numpy(float) for c in df.columns if tuple(c[1:levels - 1]) == key}
+        if "x" not in sub or "y" not in sub:
+            continue
+        x, y = sub["x"].copy(), sub["y"].copy()
+        if "likelihood" in sub:
+            bad = sub["likelihood"] < pcutoff
+            x[bad] = np.nan; y[bad] = np.nan
+        base = "_".join(str(k) for k in key)
+        cols += [x, y]; names += [f"{base}_x", f"{base}_y"]
+    return np.stack(cols, axis=1), names
+
+
+def load_auto(path: str):
+    """Load any supported file and describe it for the advisor.
+
+    Returns (data, hints) where hints = dict(kind, columns, times, fs, source):
+    kind is 'spike_times' (list of arrays), 'coco' (path, raw masks),
+    'pose' (DeepLabCut), 'table' (CSV with named columns, time along rows) or
+    'matrix' (numeric array; orientation decided later by the advisor)."""
+    import pandas as pd
+    ext = os.path.splitext(path)[1].lower()
+    hints = dict(kind="matrix", columns=None, times=None, fs=None, source=path)
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8") as fh:
+            head = json.load(fh)
+        if isinstance(head, dict) and "annotations" in head and "images" in head:
+            hints["kind"] = "coco"
+            return path, hints
+        raise ValueError("JSON file is not a COCO annotation file")
+    if ext in (".pkl", ".pickle"):
+        return load_spikes(path), dict(hints, kind="spike_times")
+    if ext == ".npy":
+        arr = np.load(path, allow_pickle=True)
+        if arr.dtype == object:
+            return [np.asarray(a, float) for a in arr], dict(hints, kind="spike_times")
+        return arr, hints
+    if ext == ".npz":
+        d = np.load(path, allow_pickle=True)
+        if "spike_times" in d.files:
+            return list(d["spike_times"]), dict(hints, kind="spike_times")
+        for k in d.files:
+            if k.lower() in _TIME_KEYS:
+                hints["times"] = np.asarray(d[k], float)
+                hints["fs"] = _fs_from_times(hints["times"])
+        arrays = {k: d[k] for k in d.files if k.lower() not in _TIME_KEYS}
+        obj = [k for k, v in arrays.items() if v.dtype == object]
+        if obj:
+            return [np.asarray(a, float) for a in arrays[obj[0]]], dict(hints, kind="spike_times")
+        key = max(arrays, key=lambda k: arrays[k].size)            # largest array = data
+        return np.asarray(arrays[key]), dict(hints, data_key=key)
+    if ext == ".csv":
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            first = [fh.readline().lower() for _ in range(4)]
+        if first[0].startswith("scorer") and any(l.startswith("coords") for l in first):
+            X, names = load_dlc_csv(path)
+            return X, dict(hints, kind="pose", columns=names)
+        df = pd.read_csv(path)
+        tcol = next((c for c in df.columns if str(c).strip().lower() in _TIME_KEYS), None)
+        if tcol is not None:
+            hints["times"] = df[tcol].to_numpy(float)
+            hints["fs"] = _fs_from_times(hints["times"])
+            df = df.drop(columns=[tcol])
+        num = df.select_dtypes(include=[np.number])
+        return num.to_numpy(float), dict(hints, kind="table", columns=[str(c) for c in num.columns])
+    raise ValueError(f"unsupported file type {ext!r}")
+
+
 def load_behavior(path: str):
     """Load behaviour variables for decoding / colouring.
 

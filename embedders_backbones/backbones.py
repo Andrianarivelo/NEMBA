@@ -25,6 +25,9 @@ from ._transformers import neuron_graph, DECAutoencoder, target_distribution, Li
 # name -> (display label, clustering kind, needs functional graph)
 BACKBONES = {
     "pca":         ("PCA baseline (no training)",   "kmeans", False),
+    "fa":          ("Factor analysis (no training)", "kmeans", False),
+    "gpfa":        ("GPFA (Gaussian-process FA)",    "kmeans", False),
+    "cebra":       ("CEBRA-time (reference package)", "kmeans", False),
     "dtc":         ("Transformer-AE + DeepCluster", "dec",    False),
     "tst":         ("Time-Series Transformer",      "kmeans", False),
     "bilstm":      ("Bi-LSTM",                       "kmeans", False),
@@ -56,8 +59,20 @@ CHANNEL_TOKEN_MODELS = {"stt", "gatr", "patchtst"}
 
 # Relative CPU cost per training step measured on 60 channels x 256 frames
 # (v0.2, 16-thread laptop CPU). Used by the GUI / docs to warn users.
-CPU_COST_HINT = {"pca": "instant", "stt": "slow", "gatr": "slow", "dwa_tcn": "slow",
+CPU_COST_HINT = {"pca": "instant", "fa": "instant", "gpfa": "medium", "cebra": "medium",
+                 "stt": "slow", "gatr": "slow", "dwa_tcn": "slow",
                  "dtc": "medium", "patchtst": "medium", "rcnn": "medium"}
+
+
+# Default embedding size when the user does not choose one: GPFA and CEBRA are
+# low-dimensional latent models (their papers use 3-10 dims; 32 GPFA latents
+# would cost ~6 min per fit on a CPU).
+DEFAULT_EMBEDDING_DIM = {"gpfa": 8, "cebra": 8}
+# CEBRA's own optimiser iterations per speed preset (it trains outside NEMBA's loop)
+CEBRA_ITERATIONS = {"fast": 500, "balanced": 2000, "accurate": 5000}
+
+# Backbones that are closed-form / external fits (no SGD in NEMBA's loop)
+CLOSED_FORM = {"pca", "fa", "gpfa", "cebra"}
 
 
 def list_backbones() -> list[str]:
@@ -86,8 +101,14 @@ def _config_class(name: str):
         return E.NeuralEmbTCNConfig
     if name in V.MODEL_REGISTRY:
         return V.TCNVariantConfig
-    if name == "pca":
+    if name in ("pca", "fa"):
         return P.PCABaselineConfig
+    if name == "gpfa":
+        from .gpfa import GPFABackboneConfig
+        return GPFABackboneConfig
+    if name == "cebra":
+        from .integrations import CEBRABackboneConfig
+        return CEBRABackboneConfig
     return None
 
 
@@ -130,6 +151,14 @@ def make_model(name: str, num_features: int, embedding_dim: int = 32,
     elif name in V.MODEL_REGISTRY:
         net = V.make_tcn_model(name, num_features, embedding_dim=embedding_dim,
                                max_len=max_len, **overrides)
+    elif name == "fa":
+        net = P.FactorAnalysisBaseline(P.PCABaselineConfig.from_dict({**base, **overrides}))
+    elif name == "gpfa":
+        from .gpfa import GPFABackbone, GPFABackboneConfig
+        net = GPFABackbone(GPFABackboneConfig.from_dict({**base, **overrides}))
+    elif name == "cebra":
+        from .integrations import CEBRABackbone, CEBRABackboneConfig
+        net = CEBRABackbone(CEBRABackboneConfig.from_dict({**base, **overrides}))
     elif name == "pca":
         net = P.PCABaseline(P.PCABaselineConfig.from_dict({**base, **overrides}))
     else:

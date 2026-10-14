@@ -481,6 +481,14 @@ METRIC_LABELS = {"r2": "R² (held-out)", "balanced_accuracy": "balanced accuracy
                  "mean_cos_dtheta": "mean cos(Δθ)"}
 
 
+# decoding feature sets: display order, label and fixed identity colour
+FEATURE_ORDER = {"embedding": 0, "raw_pca": 1, "bayes_counts": 2, "psid": 3}
+FEATURE_LABELS = {"embedding": "embedding", "raw_pca": "raw PCA",
+                  "bayes_counts": "Bayes (counts)", "psid": "PSID"}
+FEATURE_COLORS = {"embedding": CATEGORICAL[0], "raw_pca": STYLE["ink_3"],
+                  "bayes_counts": CATEGORICAL[2], "psid": CATEGORICAL[6]}
+
+
 def _wrap_breaks(t, y):
     """Insert NaN where an angle wraps around (no vertical jump lines)."""
     y = np.asarray(y, float).copy()
@@ -546,12 +554,12 @@ def decoding_figure(result, times=None, max_targets=4, excerpt_frac=0.25):
 
             b = axes[i, 1]
             rows = tab[tab.target == name].sort_values(
-                "features", key=lambda s: s.map({"embedding": 0}).fillna(1))
+                "features", key=lambda s: s.map(FEATURE_ORDER).fillna(len(FEATURE_ORDER)))
             feats = list(rows["features"])
             y = np.arange(len(feats))
             sc = rows["score"].to_numpy()
             b.barh(y, sc, height=STYLE["bar_height"],
-                   color=[CATEGORICAL[0] if f == "embedding" else STYLE["ink_3"] for f in feats])
+                   color=[FEATURE_COLORS.get(f, STYLE["ink_3"]) for f in feats])
             right = 0.0
             for yi, (_, r) in zip(y, rows.iterrows()):
                 fs = json.loads(r["fold_scores"]) if isinstance(r["fold_scores"], str) else []
@@ -563,8 +571,7 @@ def decoding_figure(result, times=None, max_targets=4, excerpt_frac=0.25):
                 b.text(x_lab, yi, f"  {r['score']:.2f}  {_ptext(r['p_holm'])}", va="center",
                        fontsize=STYLE["font_size"] - 1, color=STYLE["ink_2"])
             b.axvline(rows["chance"].iloc[0], color=STYLE["ink_3"], lw=0.6)
-            b.set_yticks(y); b.set_yticklabels(["embedding" if f == "embedding" else "raw PCA"
-                                                for f in feats])
+            b.set_yticks(y); b.set_yticklabels([FEATURE_LABELS.get(f, f) for f in feats])
             b.invert_yaxis()
             b.set_xlabel(METRIC_LABELS.get(rows["metric"].iloc[0], rows["metric"].iloc[0]))
             lo = min(0.0, float(np.nanmin(np.r_[sc, rows["null_p95"].to_numpy()])) - 0.05)
@@ -783,99 +790,188 @@ _HTML = r"""<!doctype html>
 header{padding:14px 16px 6px}h1{font-size:16px;font-weight:600;margin:0}header p{margin:2px 0 0;color:var(--ink2)}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 16px}
 .bar label{color:var(--ink2)}select,button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--grid);border-radius:6px;padding:4px 8px}
-button{cursor:pointer;min-width:64px}input[type=range]{flex:1;min-width:160px;accent-color:var(--accent)}
+button{cursor:pointer;min-width:64px}button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+button[hidden]{display:none}input[type=range]{flex:1;min-width:160px;accent-color:var(--accent)}
 main{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:12px;padding:0 16px 16px}
 @media (max-width:760px){main{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--grid);border-radius:10px;padding:8px;position:relative}
-canvas{width:100%;display:block;touch-action:none}#tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--grid);border-radius:6px;padding:4px 7px;font-size:12px;display:none;white-space:nowrap}
+canvas{width:100%;display:block;touch-action:none;outline:none;border-radius:6px}canvas:focus-visible{box-shadow:0 0 0 2px var(--accent)}
+#tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--grid);border-radius:6px;padding:4px 7px;font-size:12px;display:none;white-space:nowrap}
+#hint{margin:4px 2px 0;color:var(--ink3);font-size:12px}#hint[hidden]{display:none}
 #legend div{display:flex;align-items:center;gap:6px;margin:2px 0;color:var(--ink2)}#legend i{width:10px;height:10px;border-radius:50%;display:inline-block}
 #stats{color:var(--ink2);font-size:12px;margin-top:8px}#stats b{color:var(--ink);font-weight:600}
 </style></head><body>
 <header><h1 id="ttl"></h1><p id="sub"></p></header>
 <div class="bar"><label for="col">Colour by</label><select id="col"></select>
+<button id="view3d" aria-pressed="false" title="3-D view: drag to rotate, wheel to zoom, double-click to reset">3D</button>
 <button id="play" aria-label="Play trajectory">Play</button>
 <input id="slider" type="range" min="0" value="0" aria-label="Time"><span id="tlab"></span>
 <button id="theme" aria-label="Toggle theme">Theme</button></div>
-<main><div class="card"><canvas id="cv" height="560"></canvas><div id="tip"></div></div>
+<main><div class="card"><canvas id="cv" height="560" tabindex="0" aria-label="Embedding map"></canvas><div id="tip"></div>
+<p id="hint" hidden>drag to rotate &middot; wheel to zoom &middot; double-click or 0 to reset &middot; arrow keys rotate</p></div>
 <div class="card"><div id="legend"></div><div id="stats"></div></div></main>
 <script>
 const D = __DATA__;
 const CAT = ["#2a78d6","#eb6834","#1baf7a","#eda100","#e87ba4","#008300","#4a3aa7","#e34948","#184f95","#a8461f","#0f6e4c","#9a6a00","#a24b6e","#2e2483"];
 const RAMP = ["#cde2fb","#9ec5f4","#6da7ec","#3987e5","#256abf","#184f95","#0d366b"];
-const cv = document.getElementById("cv"), ctx = cv.getContext("2d"), tip = document.getElementById("tip");
-const sel = document.getElementById("col"), slider = document.getElementById("slider");
-document.getElementById("ttl").textContent = D.title;
-document.getElementById("sub").textContent = D.subtitle;
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d"), tip = $("tip");
+const sel = $("col"), slider = $("slider"), b3 = $("view3d"), hint = $("hint");
+$("ttl").textContent = D.title;
 const modes = [["time","time"],["state","cluster state"]].concat(Object.keys(D.behavior).map(k=>["b:"+k,k]));
 for (const [v,t] of modes){const o=document.createElement("option");o.value=v;o.textContent=t;sel.appendChild(o);}
-slider.max = D.x.length - 1;
+// Two views with the same fields: the 2-D map (V2) and the optional 3-D projection (V3).
+// When the 3-D subset differs from the 2-D one it carries its own time / state / behaviour.
+function bvals(src){const r={};for(const k of Object.keys(D.behavior))r[k]=src?src[k]:D.behavior[k].v;return r;}
+const V2={x:D.x,y:D.y,z:null,t:D.t,state:D.state,b:bvals(null),sub:D.subtitle};
+const P3=D.p3||null;
+const V3=P3?{x:P3.x,y:P3.y,z:P3.z,t:P3.same?D.t:P3.t,state:P3.same?D.state:P3.state,
+ b:P3.same?V2.b:bvals(P3.beh),sub:P3.subtitle}:null;
+let V=V2;
+if(!V3)b3.hidden=true;
+// 3-D camera: yaw / pitch in radians, zoom factor; the cloud is centred and scaled to ~unit radius
+const CAM0={yaw:-0.6,pitch:0.35,zoom:1},DIST=3.2;let cam=Object.assign({},CAM0);
+let C3=[0,0,0],R3=1;
+if(V3){const n=V3.x.length;for(let i=0;i<n;i++){C3[0]+=V3.x[i];C3[1]+=V3.y[i];C3[2]+=V3.z[i];}
+ C3=C3.map(c=>c/Math.max(1,n));const r=new Float64Array(n);
+ for(let i=0;i<n;i++){const a=V3.x[i]-C3[0],b=V3.y[i]-C3[1],c=V3.z[i]-C3[2];r[i]=Math.sqrt(a*a+b*b+c*c);}
+ r.sort();R3=Math.max(r[Math.min(n-1,Math.floor(0.98*n))]||0,1e-9);}   // robust radius: 98th percentile
+const clampP=p=>Math.max(-1.55,Math.min(1.55,p)), clampZ=z=>Math.max(0.3,Math.min(8,z));
 function lerp(a,b,t){return a+(b-a)*t}
 function hex(h){return [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)]}
 function ramp(t){t=Math.max(0,Math.min(1,t));const p=t*(RAMP.length-1),i=Math.min(Math.floor(p),RAMP.length-2),f=p-i;const a=hex(RAMP[i]),b=hex(RAMP[i+1]);return `rgb(${lerp(a[0],b[0],f)|0},${lerp(a[1],b[1],f)|0},${lerp(a[2],b[2],f)|0})`}
 function cyc(v){const t=(v+Math.PI)/(2*Math.PI);const h=Math.round(t*360);return `hsl(${h},55%,55%)`}
-function colorOf(i){const m=sel.value;
- if(m==="time") return ramp(i/(D.x.length-1));
- if(m==="state") return CAT[D.state[i]%CAT.length];
- const b=D.behavior[m.slice(2)]; if(b.kind==="discrete") return CAT[b.v[i]%CAT.length];
- if(b.kind==="circular") return cyc(b.v[i]);
- return ramp((b.v[i]-b.lo)/(b.hi-b.lo||1));}
+function colorOf(i){const m=sel.value,n=V.x.length;
+ if(m==="time") return ramp(i/Math.max(1,n-1));
+ if(m==="state") return CAT[V.state[i]%CAT.length];
+ const k=m.slice(2),b=D.behavior[k],v=V.b[k][i];
+ if(b.kind==="discrete") return v>=0?CAT[v%CAT.length]:"#9a9993";
+ if(b.kind==="circular") return cyc(v);
+ return ramp((v-b.lo)/(b.hi-b.lo||1));}
 let W=0,H=0,sx,sy;
 function fit(){const r=cv.getBoundingClientRect();const dpr=window.devicePixelRatio||1;W=r.width;H=Math.min(560,Math.max(320,r.width*0.7));cv.style.height=H+"px";cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
- const xs=D.x,ys=D.y;let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity;for(let i=0;i<xs.length;i++){x0=Math.min(x0,xs[i]);x1=Math.max(x1,xs[i]);y0=Math.min(y0,ys[i]);y1=Math.max(y1,ys[i]);}
+ const xs=V2.x,ys=V2.y;let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity;for(let i=0;i<xs.length;i++){x0=Math.min(x0,xs[i]);x1=Math.max(x1,xs[i]);y0=Math.min(y0,ys[i]);y1=Math.max(y1,ys[i]);}
  const pad=16,s=Math.min((W-2*pad)/(x1-x0||1),(H-2*pad)/(y1-y0||1));const cx=(x0+x1)/2,cy=(y0+y1)/2;sx=x=>W/2+(x-cx)*s;sy=y=>H/2-(y-cy)*s;}
-function draw(){ctx.clearRect(0,0,W,H);const n=D.x.length,cur=+slider.value;
- ctx.globalAlpha=0.55;for(let i=0;i<n;i++){ctx.fillStyle=colorOf(i);ctx.fillRect(sx(D.x[i])-1.3,sy(D.y[i])-1.3,2.6,2.6);}
- ctx.globalAlpha=1;const tail=Math.max(5,Math.round(n/60));ctx.lineWidth=2;ctx.lineCap="round";ctx.lineJoin="round";
- for(let i=Math.max(1,cur-tail);i<=cur;i++){ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue("--ink");ctx.globalAlpha=(i-(cur-tail))/tail;ctx.beginPath();ctx.moveTo(sx(D.x[i-1]),sy(D.y[i-1]));ctx.lineTo(sx(D.x[i]),sy(D.y[i]));ctx.stroke();}
- ctx.globalAlpha=1;ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue("--hot");ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue("--panel");ctx.lineWidth=2;
- ctx.beginPath();ctx.arc(sx(D.x[cur]),sy(D.y[cur]),5,0,2*Math.PI);ctx.fill();ctx.stroke();
- document.getElementById("tlab").textContent=`t = ${D.t[cur].toFixed(1)} s  |  state ${D.state[cur]}`;legend();}
-function legend(){const L=document.getElementById("legend");L.innerHTML="";const m=sel.value;
+// screen position (PX, PY), perspective factor (PF), depth (PZ) and painter's order (ORD) of the active view
+let PX=new Float32Array(0),PY=PX,PF=PX,PZ=PX,ORD=new Uint32Array(0);
+function rot(x,y,z){const cy=Math.cos(cam.yaw),sy_=Math.sin(cam.yaw),cp=Math.cos(cam.pitch),sp=Math.sin(cam.pitch);
+ const x1=cy*x+sy_*z,z1=-sy_*x+cy*z;return [x1,cp*y-sp*z1,sp*y+cp*z1];}   // yaw about the vertical axis, then pitch
+function project(){const n=V.x.length;
+ if(PX.length!==n){PX=new Float32Array(n);PY=new Float32Array(n);PF=new Float32Array(n);PZ=new Float32Array(n);ORD=new Uint32Array(n);for(let i=0;i<n;i++)ORD[i]=i;}
+ if(!V.z){for(let i=0;i<n;i++){PX[i]=sx(V.x[i]);PY[i]=sy(V.y[i]);PF[i]=1;PZ[i]=0;}return;}
+ const cy=Math.cos(cam.yaw),sy_=Math.sin(cam.yaw),cp=Math.cos(cam.pitch),sp=Math.sin(cam.pitch);
+ const s=Math.min(W,H)*0.42*cam.zoom;
+ for(let i=0;i<n;i++){const x=(V.x[i]-C3[0])/R3,y=(V.y[i]-C3[1])/R3,z=(V.z[i]-C3[2])/R3;
+  const x1=cy*x+sy_*z,z1=-sy_*x+cy*z,y2=cp*y-sp*z1,z2=Math.min(sp*y+cp*z1,DIST-0.6);
+  const f=DIST/(DIST-z2);                       // simple perspective: nearer points spread and grow
+  PX[i]=W/2+x1*s*f;PY[i]=H/2-y2*s*f;PF[i]=f;PZ[i]=z2;}
+ ORD.sort((a,b)=>PZ[a]-PZ[b]);}                  // painter's algorithm: far points first
+function gizmo(col){const L=18,ox=26,oy=H-24;ctx.save();ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=1;
+ ctx.font="10px system-ui,sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";
+ [[1,0,0],[0,1,0],[0,0,1]].forEach((a,k)=>{const r=rot(a[0],a[1],a[2]);ctx.beginPath();ctx.moveTo(ox,oy);
+  ctx.lineTo(ox+L*r[0],oy-L*r[1]);ctx.stroke();ctx.fillText(String(k+1),ox+(L+7)*r[0],oy-(L+7)*r[1]);});ctx.restore();}
+function draw(){ctx.clearRect(0,0,W,H);project();const n=V.x.length,cur=Math.min(+slider.value,n-1);
+ const cs=getComputedStyle(document.documentElement),ink=cs.getPropertyValue("--ink"),hot=cs.getPropertyValue("--hot"),panel=cs.getPropertyValue("--panel");
+ ctx.globalAlpha=0.55;
+ if(V.z){for(let k=0;k<n;k++){const i=ORD[k],r=1.3*PF[i];ctx.fillStyle=colorOf(i);ctx.fillRect(PX[i]-r,PY[i]-r,2*r,2*r);}}
+ else{for(let i=0;i<n;i++){ctx.fillStyle=colorOf(i);ctx.fillRect(PX[i]-1.3,PY[i]-1.3,2.6,2.6);}}
+ ctx.globalAlpha=1;const tail=Math.max(5,Math.round(n/60));ctx.lineWidth=2;ctx.lineCap="round";ctx.lineJoin="round";ctx.strokeStyle=ink;
+ for(let i=Math.max(1,cur-tail);i<=cur;i++){ctx.globalAlpha=(i-(cur-tail))/tail;ctx.beginPath();ctx.moveTo(PX[i-1],PY[i-1]);ctx.lineTo(PX[i],PY[i]);ctx.stroke();}
+ ctx.globalAlpha=1;ctx.fillStyle=hot;ctx.strokeStyle=panel;ctx.lineWidth=2;
+ ctx.beginPath();ctx.arc(PX[cur],PY[cur],5,0,2*Math.PI);ctx.fill();ctx.stroke();
+ if(V.z)gizmo(cs.getPropertyValue("--ink3"));
+ $("tlab").textContent=`t = ${V.t[cur].toFixed(1)} s  |  state ${V.state[cur]}`;legend();}
+function legend(){const L=$("legend");L.innerHTML="";const m=sel.value;
  const add=(c,txt)=>{const d=document.createElement("div");const i=document.createElement("i");i.style.background=c;d.appendChild(i);d.appendChild(document.createTextNode(txt));L.appendChild(d);};
  if(m==="state"){for(let k=0;k<D.K;k++)add(CAT[k%CAT.length],`state ${k}  (${(100*D.occ[k]).toFixed(1)}%)`);}
  else if(m==="time"){add(RAMP[0],"start");add(RAMP[RAMP.length-1],"end");}
  else{const b=D.behavior[m.slice(2)];if(b.kind==="discrete"){b.levels.forEach((l,k)=>add(CAT[k%CAT.length],String(l)));}
   else if(b.kind==="circular"){add(cyc(-Math.PI),"-π");add(cyc(0),"0");}else{add(RAMP[0],b.lo.toPrecision(3));add(RAMP[RAMP.length-1],b.hi.toPrecision(3));}}
- document.getElementById("stats").innerHTML=D.stats;}
-let playing=null;document.getElementById("play").onclick=e=>{if(playing){clearInterval(playing);playing=null;e.target.textContent="Play";return;}
- e.target.textContent="Pause";playing=setInterval(()=>{slider.value=(+slider.value+Math.max(1,Math.round(D.x.length/600)))%D.x.length;draw();},30);};
-slider.oninput=draw;sel.onchange=draw;window.onresize=()=>{fit();draw();};
-document.getElementById("theme").onclick=()=>{const r=document.documentElement;const dark=r.dataset.theme?r.dataset.theme==="dark":matchMedia("(prefers-color-scheme: dark)").matches;r.dataset.theme=dark?"light":"dark";draw();};
-cv.onmousemove=e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let best=-1,bd=144;
- for(let i=0;i<D.x.length;i++){const dx=sx(D.x[i])-mx,dy=sy(D.y[i])-my,d=dx*dx+dy*dy;if(d<bd){bd=d;best=i;}}
- if(best<0){tip.style.display="none";return;}let s=`t = ${D.t[best].toFixed(2)} s<br>state ${D.state[best]}`;
- for(const k of Object.keys(D.behavior)){const b=D.behavior[k];s+=`<br>${k}: ${b.kind==="discrete"?b.levels[b.v[best]]:(+b.v[best]).toPrecision(3)}`;}
- tip.innerHTML=s;tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+8)+"px";};
-cv.onmouseleave=()=>tip.style.display="none";
-// shareable views: explorer.html#color=state&t=0.45  (t = fraction of the recording)
-if(typeof location!=="undefined"&&location.hash){const H=new URLSearchParams(location.hash.slice(1));
- if(H.get("color")){const c=H.get("color");sel.value=modes.some(m=>m[0]===c)?c:("b:"+c);}
- if(H.get("t"))slider.value=Math.round(Math.max(0,Math.min(1,+H.get("t")))*(D.x.length-1));}
-fit();draw();
+ $("stats").innerHTML=D.stats;}
+// shareable views: explorer.html#color=state&t=0.45&view=3d (t = fraction of the recording);
+// written back on deliberate changes only (never during playback: browsers throttle replaceState)
+function share(){try{if(typeof history==="undefined"||!history.replaceState)return;const q=new URLSearchParams();
+ q.set("color",sel.value);q.set("t",((+slider.value)/Math.max(1,V.x.length-1)).toFixed(3));if(V===V3)q.set("view","3d");
+ history.replaceState(null,"","#"+q.toString());}catch(_){}}
+function setView(want3,frac,quiet){const v3=!!(want3&&V3);
+ if(frac===undefined)frac=(+slider.value)/Math.max(1,V.x.length-1);
+ V=v3?V3:V2;slider.max=V.x.length-1;slider.value=Math.round(Math.max(0,Math.min(1,frac))*(V.x.length-1));
+ b3.setAttribute("aria-pressed",v3?"true":"false");hint.hidden=!v3;cv.style.cursor=v3?"grab":"default";
+ $("sub").textContent=V.sub;tip.style.display="none";fit();draw();if(!quiet)share();}
+let playing=null;$("play").onclick=()=>{const btn=$("play");if(playing){clearInterval(playing);playing=null;btn.textContent="Play";share();return;}
+ btn.textContent="Pause";playing=setInterval(()=>{const n=V.x.length;slider.value=(+slider.value+Math.max(1,Math.round(n/600)))%n;draw();},30);};
+slider.oninput=draw;slider.onchange=share;sel.onchange=()=>{draw();share();};window.onresize=()=>{fit();draw();};
+b3.onclick=()=>setView(V!==V3);
+$("theme").onclick=()=>{const r=document.documentElement;const dark=r.dataset.theme?r.dataset.theme==="dark":matchMedia("(prefers-color-scheme: dark)").matches;r.dataset.theme=dark?"light":"dark";draw();};
+function hover(e){const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let best=-1,bd=144,front=-1,fz=-Infinity;
+ for(let i=0;i<PX.length;i++){const dx=PX[i]-mx,dy=PY[i]-my,d=dx*dx+dy*dy;if(d<bd){bd=d;best=i;}
+  if(V.z&&d<16&&PZ[i]>fz){fz=PZ[i];front=i;}}           // 3-D: the front-most point under the cursor wins
+ if(front>=0)best=front;
+ if(best<0){tip.style.display="none";return;}let s=`t = ${V.t[best].toFixed(2)} s<br>state ${V.state[best]}`;
+ for(const k of Object.keys(D.behavior)){const b=D.behavior[k],v=V.b[k][best];
+  s+=`<br>${k}: ${b.kind==="discrete"?((v>=0&&v<b.levels.length)?b.levels[v]:"?"):(+v).toPrecision(3)}`;}
+ tip.innerHTML=s;tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+8)+"px";}
+// pointer: hover in both views, drag rotates the 3-D view
+let drag=null;
+cv.onpointerdown=e=>{if(!V.z)return;drag={x:e.clientX,y:e.clientY};tip.style.display="none";cv.style.cursor="grabbing";
+ try{if(e.pointerId!==undefined&&cv.setPointerCapture)cv.setPointerCapture(e.pointerId);}catch(_){}};
+cv.onpointermove=e=>{if(drag){cam.yaw+=(e.clientX-drag.x)*0.01;cam.pitch=clampP(cam.pitch+(e.clientY-drag.y)*0.01);
+  drag={x:e.clientX,y:e.clientY};draw();return;}hover(e);};
+cv.onpointerup=cv.onpointercancel=()=>{if(drag){drag=null;cv.style.cursor=V.z?"grab":"default";}};
+cv.onpointerleave=()=>{if(!drag)tip.style.display="none";};
+cv.ondblclick=()=>{if(V.z){cam=Object.assign({},CAM0);draw();}};
+cv.addEventListener("wheel",e=>{if(!V.z)return;e.preventDefault();cam.zoom=clampZ(cam.zoom*Math.exp(-e.deltaY*0.0015));draw();},{passive:false});
+cv.onkeydown=e=>{if(!V.z)return;const k=e.key;let used=true;
+ if(k==="ArrowLeft")cam.yaw-=0.08;else if(k==="ArrowRight")cam.yaw+=0.08;
+ else if(k==="ArrowUp")cam.pitch=clampP(cam.pitch-0.08);else if(k==="ArrowDown")cam.pitch=clampP(cam.pitch+0.08);
+ else if(k==="+"||k==="=")cam.zoom=clampZ(cam.zoom*1.15);else if(k==="-")cam.zoom=clampZ(cam.zoom/1.15);
+ else if(k==="0")cam=Object.assign({},CAM0);else used=false;
+ if(used){e.preventDefault();draw();}};
+let start3=false,startT;
+if(typeof location!=="undefined"&&location.hash){const Q=new URLSearchParams(location.hash.slice(1));
+ if(Q.get("color")){const c=Q.get("color"),v=modes.some(m=>m[0]===c)?c:("b:"+c);if(modes.some(m=>m[0]===v))sel.value=v;}
+ start3=Q.get("view")==="3d";
+ if(Q.get("t")!==null&&isFinite(+Q.get("t")))startT=Math.max(0,Math.min(1,+Q.get("t")));}
+fit();setView(start3,startT===undefined?0:startT,true);
 </script></body></html>
 """
 
 
-def interactive_html(emb, save_path, behavior=None, method="umap", max_behaviors=6, circular=()):
+def interactive_html(emb, save_path, behavior=None, method="umap", max_behaviors=6, circular=(),
+                     view3d=True, max_points_3d=6000):
     """Write a self-contained interactive explorer (hover, colour switch,
-    trajectory playback, light/dark) for a fitted ``Embedder``."""
+    trajectory playback, light/dark, optional 3-D view) for a fitted ``Embedder``.
+
+    The 2-D map uses ``emb.projection(method)``. With ``view3d=True`` a
+    3-component projection is added (``manifold.project3d`` with the same
+    method when it is 'pca', 'umap' or 'tphate', otherwise PCA) and a "3D"
+    toggle appears: drag to rotate, wheel to zoom, points depth-sorted. The
+    3-D view reuses the 2-D frame subset when the two coincide (same strided
+    frames); otherwise it carries its own time, state and behaviour values.
+    ``max_points_3d`` caps the 3-D subset (each redraw sorts every point).
+    URL-hash views: ``#color=state&t=0.45&view=3d``."""
     from .backbones import label as _label
     P, idx = emb.projection(method)
     st = state_statistics(emb.states)
     beh = {}
-    for k, v in list((behavior or {}).items())[:max_behaviors]:
-        v = np.asarray(v)[idx]
+    specs = {}                                   # name -> (kind, levels, full series) for the 3-D subset
+    for k, v_full in list((behavior or {}).items())[:max_behaviors]:
+        v_full = np.asarray(v_full)
+        v = v_full[idx]
         vals, _, norm, kind = _color_spec(len(v), "behavior", behavior=v, circular=k in circular)
         if kind == "circular":
             beh[k] = dict(kind="circular", v=np.nan_to_num(v.astype(float)).round(4).tolist())
+            specs[k] = ("circular", None, v_full)
         elif kind == "discrete":
             levels = np.unique(v)
             beh[k] = dict(kind="discrete", v=vals.astype(int).tolist(),
                           levels=[str(x) for x in levels])
+            specs[k] = ("discrete", levels, v_full)
         else:
             fin = np.where(np.isfinite(v.astype(float)), v.astype(float), np.nan)
             beh[k] = dict(kind="continuous", v=np.nan_to_num(fin).round(4).tolist(),
                           lo=float(norm.vmin), hi=float(norm.vmax))
+            specs[k] = ("continuous", None, v_full)
     dec = ""
     if emb.decoding is not None:
         te = emb.decoding.table[emb.decoding.table.features == "embedding"]
@@ -886,14 +982,56 @@ def interactive_html(emb, save_path, behavior=None, method="umap", max_behaviors
              f"<br>circularity <b>{m.get('circularity', float('nan')):.3f}</b>"
              f"<br>participation ratio <b>{m.get('participation_ratio', float('nan')):.2f}</b>"
              + (f"<br><br>decoding<br>{dec}" if dec else ""))
+    pretty = {"pca": "PCA", "umap": "UMAP", "tsne": "t-SNE", "tphate": "T-PHATE"}
+
+    def _view3d():
+        """3-D payload of the explorer, or None when it cannot be computed.
+
+        The subset size requested from ``project3d`` equals the 2-D one (capped
+        at ``max_points_3d``), so both use the same strided frames whenever
+        ``analysis.subsample_index`` gives the same stride; when they differ
+        the 3-D view gets its own time / state / behaviour arrays, mapped onto
+        the 2-D colour scales (discrete levels, continuous range)."""
+        from .manifold import project3d
+        # view3d may name the 3-D method ("pca" is instant; "umap" / "tphate" cost
+        # seconds); True reuses the 2-D method
+        m3 = view3d if isinstance(view3d, str) else (
+            method if method in ("pca", "umap", "tphate") else "pca")
+        try:
+            P3, idx3 = project3d(emb.Z, m3, max_points=int(min(len(idx), max_points_3d)),
+                                 seed=emb.seed)
+            P3, idx3 = np.asarray(P3, float), np.asarray(idx3)
+        except Exception:  # noqa: BLE001  (e.g. a 2-D embedding: no third axis)
+            return None
+        if P3.ndim != 2 or P3.shape[1] < 3 or not np.isfinite(P3).all():
+            return None
+        out = dict(x=P3[:, 0].round(4).tolist(), y=P3[:, 1].round(4).tolist(),
+                   z=P3[:, 2].round(4).tolist(), same=bool(np.array_equal(idx3, idx)),
+                   subtitle=f"{pretty.get(m3, m3.upper())} 3-D of {len(idx3):,} / {len(emb.Z):,} "
+                            f"frames, {emb.X_input.shape[0]} input channels, drag to rotate")
+        if not out["same"]:
+            out["t"] = np.asarray(emb.times)[idx3].round(3).tolist()
+            out["state"] = np.asarray(emb.states)[idx3].astype(int).tolist()
+            b3 = {}
+            for k, (kind, levels, v_full) in specs.items():
+                v3 = v_full[idx3]
+                if kind == "discrete":
+                    # index into the 2-D levels; frames with an unseen level get -1 (grey)
+                    pos = np.clip(np.searchsorted(levels, v3), 0, len(levels) - 1)
+                    b3[k] = np.where(levels[pos] == v3, pos, -1).astype(int).tolist()
+                else:
+                    b3[k] = np.nan_to_num(v3.astype(float)).round(4).tolist()
+            out["beh"] = b3
+        return out
+
     data = dict(title=f"{_label(emb.backbone)} embedding explorer",
-                subtitle=f"{method.upper()} of {len(idx):,} / {len(emb.Z):,} frames, "
-                         f"{emb.X_input.shape[0]} input channels, hover a point for details",
+                subtitle=f"{pretty.get(method, method.upper())} of {len(idx):,} / {len(emb.Z):,} "
+                         f"frames, {emb.X_input.shape[0]} input channels, hover a point for details",
                 x=P[:, 0].round(4).tolist(), y=P[:, 1].round(4).tolist(),
                 t=np.asarray(emb.times)[idx].round(3).tolist(),
                 state=np.asarray(emb.states)[idx].astype(int).tolist(),
                 K=int(len(st["occupancy"])), occ=st["occupancy"].round(4).tolist(),
-                behavior=beh, stats=stats)
+                behavior=beh, stats=stats, p3=_view3d() if view3d else None)
     with open(save_path, "w", encoding="utf-8") as fh:
         fh.write(_HTML.replace("__DATA__", json.dumps(data)))
     return save_path

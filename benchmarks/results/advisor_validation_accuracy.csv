@@ -1,0 +1,33 @@
+case,check,correct,n,accuracy,ci95_low,ci95_high
+ring spike times,modality,10,10,1.0,0.7224598312333834,1.0
+ring spike times,axis,10,10,1.0,0.7224598312333834,1.0
+ring spike times,ring,10,10,1.0,0.7224598312333834,1.0
+ring spike times,clusters,10,10,1.0,0.7224598312333834,1.0
+ring counts,modality,10,10,1.0,0.7224598312333834,1.0
+ring counts,axis,10,10,1.0,0.7224598312333834,1.0
+ring counts,ring,10,10,1.0,0.7224598312333834,1.0
+ring counts,clusters,10,10,1.0,0.7224598312333834,1.0
+ring counts (transposed),modality,10,10,1.0,0.7224598312333834,1.0
+ring counts (transposed),axis,10,10,1.0,0.7224598312333834,1.0
+ring counts (transposed),ring,10,10,1.0,0.7224598312333834,1.0
+ring counts (transposed),clusters,10,10,1.0,0.7224598312333834,1.0
+metastable counts,modality,10,10,1.0,0.7224598312333834,1.0
+metastable counts,axis,10,10,1.0,0.7224598312333834,1.0
+metastable counts,ring,10,10,1.0,0.7224598312333834,1.0
+metastable counts,clusters,10,10,1.0,0.7224598312333834,1.0
+sheet counts,modality,10,10,1.0,0.7224598312333834,1.0
+sheet counts,axis,10,10,1.0,0.7224598312333834,1.0
+sheet counts,ring,10,10,1.0,0.7224598312333834,1.0
+sheet counts,clusters,10,10,1.0,0.7224598312333834,1.0
+calcium traces,modality,10,10,1.0,0.7224598312333834,1.0
+calcium traces,axis,10,10,1.0,0.7224598312333834,1.0
+calcium traces,ring,10,10,1.0,0.7224598312333834,1.0
+calcium traces,clusters,10,10,1.0,0.7224598312333834,1.0
+photometry,modality,10,10,1.0,0.7224598312333834,1.0
+photometry,axis,10,10,1.0,0.7224598312333834,1.0
+photometry,ring,10,10,1.0,0.7224598312333834,1.0
+photometry,clusters,10,10,1.0,0.7224598312333834,1.0
+pose (no names),modality,10,10,1.0,0.7224598312333834,1.0
+pose (no names),axis,10,10,1.0,0.7224598312333834,1.0
+pose (no names),ring,10,10,1.0,0.7224598312333834,1.0
+pose (no names),clusters,10,10,1.0,0.7224598312333834,1.0

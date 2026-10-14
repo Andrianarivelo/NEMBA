@@ -52,6 +52,46 @@ there. Every picture in this README comes from that demo
 
 ---
 
+## 🧭 Not sure where to start? Ask the advisor
+
+Hand NEMBA any recording and it tells you **what the data is** and **how to
+embed and show it**, with the number behind every suggestion:
+
+```python
+from embedders_backbones import advise, Embedder
+
+rec = advise(data, behavior=beh, behavior_times=t_beh)   # spikes, matrix, DataFrame or a file path
+print(rec.report())                                       # what it found, what to do, why
+emb = rec.fit(data)                                       # run the suggestion...
+emb = Embedder.auto(data)                                 # ...or profile + fit in one call
+```
+```bash
+python main.py --advise --file recording.npy             # report + data_profile figure
+python main.py --auto --file pose.csv --behavior beh.csv # run the recommended pipeline
+```
+
+![data profile](docs/images/fig_data_profile.png)
+
+What it measures: the input kind and **which axis is time**; counts vs continuous
+values; the likely modality (spike times, binned counts, calcium, fiber
+photometry, pose keypoints, masks / pixels); timescales and spectral peaks; slow
+drift and photobleaching; dimensionality; a **loop** (ring topology) and
+**discrete clusters** in a quick smoothed PCA; and the type of every behaviour
+variable (continuous, discrete, angle). From that it picks the file adapter,
+bin size, preprocessing (dF/F, NaN interpolation), backbone, objective,
+embedding size, smoothing, window, state model, projections, figures and the
+decoding settings, and always adds no-training baselines to compare against.
+An example report: [`docs/images/advice_example.md`](docs/images/advice_example.md).
+
+How often is it right? On 80 synthetic recordings with known answers (8 kinds x
+10 seeds, `benchmarks/validate_advisor.py`): modality, time axis, cluster
+structure and ring structure were each identified 80 / 80 times (95 % CI 95-100
+%). Honest fine print: the ring threshold was calibrated on seeds 0-4 and
+checked on held-out seeds 5-9 (25 / 25), with a thin margin; real data are
+messier than any simulator, so read the evidence column, not just the verdict.
+
+---
+
 ## 🖥️ The app
 
 `NEMBA.bat`, `python main.py`, or **F5** in VS Code ("NEMBA: GUI"). Pick a file
@@ -63,14 +103,25 @@ freezes: training runs in the background, the progress bar shows each step, and
 
 | Tab | What you get |
 |---|---|
+| **Advisor** | press **Analyse data**: what the data is, what to do and why; **Apply suggestions** fills the sidebar, **Run suggested** runs it |
 | **Overview** | the one-page dashboard (below) |
-| **Embedding** | projection (UMAP / PCA / t-SNE) coloured by time, state or any behaviour |
-| **Decoding** | held-out predictions vs truth + a sortable table of scores and p-values |
+| **Embedding** | projection (UMAP / PCA / t-SNE / T-PHATE) coloured by time, state or any behaviour |
+| **Decoding** | held-out predictions vs truth + a sortable table (embedding, raw PCA, Bayes counts, PSID) |
+| **Dynamics** | topology barcode, flow field, recurrence, Rastermap, states vs labels, each with its statistics |
 | **Training** | loss curves (train and held-out validation) |
-| **Compare** | several backbones side by side, with metrics and decoding tables |
+| **Compare** | several backbones side by side: embeddings, metrics, decoding, consistency matrix |
 | **Log** | everything that happened, in colour |
 
+The Model card exposes the likelihood (Gaussian / Poisson), masking (time /
+neuron / both), state model (K-means / HMM / AR-HMM) and embedding size; the
+Behaviour card the decoder (linear / kNN / boosting / logistic), PSID rows and
+the co-smoothing score.
+
 <table>
+<tr>
+<td><img src="docs/images/gui_advisor.png" alt="advisor tab"><br><sub><b>Advisor</b>: profile figure + explained recommendation</sub></td>
+<td><img src="docs/images/gui_dynamics.png" alt="dynamics tab"><br><sub><b>Dynamics</b>: flow field, topology, recurrence, Rastermap</sub></td>
+</tr>
 <tr>
 <td><img src="docs/images/gui_embedding.png" alt="embedding tab"><br><sub><b>Embedding</b>: switch projection and colouring live</sub></td>
 <td><img src="docs/images/gui_decoding.png" alt="decoding tab"><br><sub><b>Decoding</b>: predictions, null test, raw baseline</sub></td>
@@ -122,6 +173,32 @@ the embedding (blue) and of the **raw input** (grey, same pipeline), the folds
 ![states](docs/images/fig_states.png)
 ![state dynamics](docs/images/fig_state_dynamics.png)
 
+### Dynamics and geometry
+
+| | |
+|---|---|
+| ![topology](docs/images/fig_topology.png) **Topology**: persistent homology barcode; loops (H1) that outlive a Gaussian null reveal rings / tori (head direction, grid cells) | ![flow](docs/images/fig_flow_field.png) **Flow field**: average direction of the latent trajectory per region, with a coherence score |
+| ![recurrence](docs/images/fig_recurrence.png) **Recurrence**: when does the population revisit the same state? | ![contingency](docs/images/fig_contingency.png) **States vs labels**: discovered states against annotated behaviour (ARI / NMI with a circular-shift null) |
+
+![rastermap](docs/images/fig_rastermap.png)
+
+**Rastermap** (Stringer et al. 2025) sorts neurons so that cells with similar
+activity sit together, aligned with the states and the behaviour below
+(`pip install rastermap`; a PCA-angle ordering is used otherwise).
+
+### Time-aware projection (T-PHATE)
+
+![tphate by phase](docs/images/fig_tphate.png)
+![tphate by state](docs/images/fig_tphate_states.png)
+
+`methods=("pca", "tphate")`: a native re-implementation of T-PHATE (Busch et al.
+2023; not the reference package, see `manifold.py`), a diffusion embedding that
+also links frames close in time. It emphasises **slow** structure: on this demo
+it separates the three behavioural states far better than PCA (2-D silhouette
+0.49 vs 0.02) while blurring the faster ring phase that PCA keeps (phase
+preservation 0.05 vs 0.91). On a clean slow ring it preserves the ring (0.995).
+Use both views: they answer different questions.
+
 ### Training curve
 
 <img src="docs/images/fig_training.png" alt="training" width="45%">
@@ -132,8 +209,10 @@ the embedding (blue) and of the **raw input** (grey, same pipeline), the folds
 
 `<backbone>_explorer.html` opens in any browser, no internet needed: hover a
 point for its time, state and behaviour, switch the colouring, press Play to
-watch the trajectory, toggle light/dark. Share a view with a link hash such as
-`explorer.html#color=state&t=0.45`.
+watch the trajectory, toggle light/dark, and switch to a **3-D view** (drag to
+rotate, wheel to zoom; PCA by default, `run(explorer_3d="umap")` for UMAP).
+Share a view with a link hash such as
+`explorer.html#color=state&t=0.45` (add `&view=3d` to open in 3-D).
 
 ### Comparing backbones
 
@@ -145,6 +224,12 @@ watch the trajectory, toggle light/dark. Share a view with a link hash such as
 The grey "raw PCA (input)" bar is the baseline every backbone must beat. Spoiler
 for the demo: it is hard to beat, see the benchmark.
 
+<img src="docs/images/cmp_consistency.png" alt="consistency" width="49%">
+
+**Consistency** (as in CEBRA): how well one embedding predicts another through a
+linear map (cross-validated R²). High values mean two backbones found the same
+structure; low values mean their geometries disagree.
+
 All figures are saved as **png, pdf and svg**; all numbers as **csv / json**:
 
 | file | content |
@@ -154,6 +239,7 @@ All figures are saved as **png, pdf and svg**; all numbers as **csv / json**:
 | `<bb>_decoding.csv` | score, folds, null mean and 95th percentile, p, Holm p, gap, baseline delta |
 | `<bb>_metrics.csv/.json`, `_params.json` | geometry metrics, timings, **every setting** |
 | `<bb>_k_selection.csv`, `_state_stats.csv`, `_transitions.csv`, `_training_curve.csv` | the numbers behind each panel |
+| `<bb>_topology`, `_flow_field`, `_recurrence`, `_rastermap`, `_contingency_<label>` | dynamics figures, with `_dynamics_stats.csv`, `_neuron_order.csv`, `_contingency_<label>.csv` |
 | `<bb>_embedding.npz` | `Z`, `Z_raw`, `states`, `times` |
 
 Figure style lives in one dictionary: `STYLE` in `embedders_backbones/viz.py`.
@@ -172,9 +258,25 @@ Decoding time series is full of traps. NEMBA steps around them for you:
 | "my deep net decodes X" (so does PCA?) | every target is also decoded from the **raw input**; `delta_vs_raw` is what the encoder adds |
 | angles wrap around | circular targets decoded through sin/cos, scored with mean cos(error) and degrees |
 
-Decoders: `linear` (ridge / shrinkage LDA, default), `knn`, `logistic`.
+| decoder / feature set | what it is | when |
+|---|---|---|
+| `linear` (default) | ridge / shrinkage LDA | interpretable, fast, vectorised null |
+| `knn` | k-nearest neighbours | non-linear, CEBRA-style evaluation |
+| `gbm` | gradient-boosted trees (Glaser et al. 2020) | curved relationships; null capped at 49 shifts (each shift is a refit) |
+| `logistic` | multinomial logistic regression | discrete labels |
+| **`bayes_counts`** rows (automatic with spikes) | Poisson population decoder on raw counts (Zhang et al. 1998) | classic place / head-direction decoding, no embedding needed |
+| **`psid`** rows (`decode(..., psid=True)`) | behaviour-prioritised linear dynamics (PSID, Sani et al. 2021), refit inside every fold | is there a low-dimensional, behaviour-specific dynamical subspace? |
+
 Tip: the smallest possible p is 1/(n_perm + 1) before correction, so use
 `n_perm >= 20 x` the number of targets (NEMBA warns you).
+
+### Co-smoothing: choosing a model without labels
+
+`emb.cosmooth()` holds out 20 % of the neurons and the last 20 % of the
+recording, trains on the rest, and predicts the hidden neurons from the latents
+(Poisson GLM), scored in **bits per spike** (Neural Latents Benchmark, Pei et
+al. 2021). No behaviour is used, so it can rank backbones without the selection
+bias of picking the best decoder on the same labels.
 
 ---
 
@@ -209,6 +311,9 @@ Under the hood, compared with v0.1:
 | key | what it is | CPU |
 |---|---|---|
 | `pca` | **no training at all**, the honest baseline | instant |
+| `fa` | factor analysis: PCA with per-neuron noise (no training) | instant |
+| `gpfa` | Gaussian-process factor analysis (Yu et al. 2009), native EM, learns a timescale per latent | medium |
+| `cebra` | CEBRA-time via the reference package (Schneider et al. 2023; `pip install cebra`) | medium |
 | `tcn`, `ed_tcn`, `dilated_tcn`, `ms_tcn`, `ms_tcnpp`, `c2f_tcn`, `stcn`, `c_tcn`, `dc_tcn`, `nac_tcn`, `pit_tcn` | the temporal-convolution family ([details](TCN_VARIANTS.md)) | fast |
 | `dwa_tcn` | dynamic-alignment TCN | slow |
 | `tst`, `dtc`, `vit`, `enc_crf`, `patchtst`, `embtcn` | transformers (`dtc` adds deep clustering, `enc_crf` a CRF state decoder) | fast to medium |
@@ -217,7 +322,47 @@ Under the hood, compared with v0.1:
 
 Objectives: `masked` (default: rebuild hidden stretches from context),
 `contrastive` (CEBRA-time style: nearby moments close, others far; favours slow
-features), `hybrid` (both).
+features), `hybrid` (both). For spikes, two more knobs:
+
+| option | values | meaning |
+|---|---|---|
+| `likelihood` | `gaussian` (default), `poisson`, `auto` | Poisson = predict raw counts (log-rate around each neuron's mean rate), as LFADS / NDT do |
+| `mask_mode` | `time` (default), `neuron`, `both` | hide time spans, whole neurons, or alternate (multi-task masking, Zhang et al. 2024); neuron masks make validation a co-smoothing proxy (reported in bits/spike) |
+
+Measured, not assumed (`benchmarks/results/objectives_*`): none of these
+variants beat the default on co-smoothing or decoding (6 paired fits, all
+Holm-corrected p > 0.4), and the untrained PCA / FA scored the best co-smoothing.
+Poisson + neuron masks leaned towards better state recovery (ARI +0.14, 95 % CI
+-0.08 to +0.35), so the advisor suggests it when states are the goal.
+
+### States
+
+`state_model="auto"` keeps each backbone's clustering (K-means, deep embedded
+clustering, CRF). `"hmm"` (sticky Gaussian HMM) and `"arhmm"` (autoregressive
+HMM, for pose / behaviour dynamics; MoSeq-style) model how states persist and
+switch over time; with `n_states=None`, K is chosen by held-out likelihood. The
+temporal models are fitted on the **unsmoothed** embedding (they do their own
+temporal integration).
+
+![states validation](benchmarks/results/states_validation.png)
+
+What the validation says (`benchmarks/validate_states.py`, 5 seeds): on
+unsmoothed features the HMMs recover the true states almost perfectly (ARI 0.998
+/ 0.999 vs 0.837 for frame-wise K-means) and remove K-means' flicker (up to 30x
+too many transitions). On *smoothed* features (the default `smooth_sigma=4`),
+plain K-means is already as good (ARI 0.99) and the AR-HMM fails (it models the
+smoothing kernel). Automatic K hits the upper bound on a continuous manifold for
+every method: when that happens, fix K or study the manifold instead.
+
+### Across sessions
+
+```python
+from embedders_backbones.align import align_sessions, consistency_matrix
+Z2_aligned, T, r2 = align_sessions(Z1, beh1, Z2, beh2, method="cca")   # different neurons, same task
+```
+Sessions with different neurons are aligned through behaviour-binned anchors
+(Procrustes or CCA, as in Gallego et al. 2020), with a held-out anchor R² to
+tell you whether the alignment is real.
 
 ---
 
@@ -274,8 +419,26 @@ What it means, without spin:
 
 Full tables: `benchmark_paired_stats.csv` (normality check, test used, CIs,
 effect sizes, Holm p), `benchmark_summary.csv`, `benchmark_raw.csv`.
-Where to go next (Poisson objectives, neuron masking, co-smoothing, HMM states,
-CEBRA, Rastermap, ...): [`docs/EMBEDDERS_REVIEW.md`](docs/EMBEDDERS_REVIEW.md).
+The literature review that motivated the next round (and what came out of it):
+[`docs/EMBEDDERS_REVIEW.md`](docs/EMBEDDERS_REVIEW.md).
+
+### Do the new objectives help? (`benchmarks/benchmark_objectives.py`)
+
+![objectives](benchmarks/results/objectives.png)
+
+Gaussian vs Poisson likelihood x time vs time + neuron masking, on TCN and TST, 3
+recordings, scored by co-smoothing, decoding and state recovery. **No variant
+beat the default** (6 paired fits each, Shapiro-Wilk then paired t / Wilcoxon,
+all Holm-corrected p > 0.4). The untrained PCA / FA kept the best co-smoothing
+(0.446 vs 0.425-0.435 bits/spike) and speed decoding. Poisson + neuron masks
+leaned towards better state recovery (mean ARI 0.71 vs 0.57; CI includes 0).
+Defaults therefore stay as they are; the options are there for your data.
+(Fit times in this run are not reliable: the machine stalled for ~45 min during
+one fit, so speed was not compared.)
+
+### Does the advisor read data correctly? (`benchmarks/validate_advisor.py`)
+
+![advisor validation](benchmarks/results/advisor_validation.png)
 
 ---
 
@@ -308,7 +471,16 @@ Z_new = Embedder.load("encoder.pt").transform(X_new)     # X_new: [channels, tim
   on held-out decoding, it is not earning its CPU time on your data.
 * **Smoothing is a choice** (`smooth_sigma=4` frames by default): great for slow
   variables, blurs fast ones. It is saved in `params.json`.
-* What changed and why, with evidence: [`AUDIT.md`](AUDIT.md).
+* **The advisor is a set of measured rules, not an oracle.** It was validated on
+  simulations; on real data, read its evidence column and check the baselines it
+  adds.
+* **Unsupervised states are fragile**: the same model can recover the true states
+  with ARI 0.96 on one recording and 0.03 on the next. Compare runs and seeds
+  before naming a state.
+* **2-D pictures distort** (Chari & Pachter 2023): every projection here comes
+  with numbers computed in the full space (decoding, silhouette, persistence).
+* What changed and why, with evidence: [`AUDIT.md`](AUDIT.md) and
+  [`docs/EMBEDDERS_REVIEW.md`](docs/EMBEDDERS_REVIEW.md).
 
 ## 🔧 Install
 

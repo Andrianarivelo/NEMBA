@@ -1,0 +1,152 @@
+{
+ "SEEDS": [
+  0,
+  1,
+  2,
+  3,
+  4
+ ],
+ "METHODS": [
+  "kmeans",
+  "hmm",
+  "arhmm"
+ ],
+ "HMM_T": 6000,
+ "HMM_K": 4,
+ "HMM_D": 8,
+ "HMM_P_STAY": 0.98,
+ "HMM_SEP": 0.5,
+ "HMM_NOISE": 1.0,
+ "N_NEURONS": 60,
+ "DURATION_S": 600.0,
+ "DT": 0.1,
+ "N_PCS": 10,
+ "SMOOTH_SIGMA": 4.0,
+ "CONDITIONS": {
+  "hmm_k4": {
+   "data": "hmm",
+   "sigma": null,
+   "k": 4,
+   "label": "Sticky HMM\nK = 4"
+  },
+  "hmm_auto": {
+   "data": "hmm",
+   "sigma": null,
+   "k": null,
+   "label": "Sticky HMM\nauto K"
+  },
+  "nemba_k3": {
+   "data": "nemba",
+   "sigma": 4.0,
+   "k": 3,
+   "label": "NEMBA, \u03c3 = 4\nK = 3"
+  },
+  "nemba_auto": {
+   "data": "nemba",
+   "sigma": 4.0,
+   "k": null,
+   "label": "NEMBA, \u03c3 = 4\nauto K"
+  },
+  "nemba_raw_k3": {
+   "data": "nemba",
+   "sigma": 0.0,
+   "k": 3,
+   "label": "NEMBA, \u03c3 = 0\nK = 3"
+  }
+ },
+ "K_RANGE": [
+  2,
+  10
+ ],
+ "N_FOLDS": 3,
+ "SE_RULE": "fold",
+ "STATE_KW": {},
+ "KMEANS_N_INIT": 10,
+ "SIL_SAMPLE": 3000,
+ "TIMING": true,
+ "TIMING_T": 100000,
+ "TIMING_K": 12,
+ "TIMING_D": 32,
+ "TIMING_REPEATS": 3,
+ "ALPHA": 0.05,
+ "COMPARISONS": [
+  [
+   "hmm",
+   "kmeans"
+  ],
+  [
+   "arhmm",
+   "kmeans"
+  ],
+  [
+   "arhmm",
+   "hmm"
+  ]
+ ],
+ "STAT_METRICS": [
+  "ari",
+  "nmi",
+  "trans_err",
+  "dwell_err",
+  "log10_fit_s"
+ ],
+ "FIG_FORMATS": [
+  "png",
+  "pdf",
+  "svg"
+ ],
+ "FIG_W": 7.2,
+ "ROW_H": 1.5,
+ "FONT": 7,
+ "DPI": 300,
+ "COLORS": {
+  "kmeans": "#2a78d6",
+  "hmm": "#eb6834",
+  "arhmm": "#1baf7a"
+ },
+ "NAMES": {
+  "kmeans": "K-means (frame-wise)",
+  "hmm": "Gaussian HMM",
+  "arhmm": "AR-HMM"
+ },
+ "INK": "#0b0b0b",
+ "INK2": "#52514e",
+ "GRID": "#e4e3df",
+ "BAR_W": 0.12,
+ "FIG_METRICS": [
+  [
+   "ari",
+   "ARI vs true states",
+   "linear",
+   "ari"
+  ],
+  [
+   "trans_ratio",
+   "transitions / true",
+   "log",
+   "trans_err"
+  ],
+  [
+   "dwell_ratio",
+   "median dwell / true",
+   "log",
+   "dwell_err"
+  ],
+  [
+   "fit_s",
+   "fit time (s)",
+   "log",
+   "log10_fit_s"
+  ]
+ ],
+ "HERE": "D:\\Apps\\NEMBA\\benchmarks",
+ "ROOT": "D:\\Apps\\NEMBA",
+ "OUT": "D:\\Apps\\NEMBA\\benchmarks\\results",
+ "sticky_frac": 0.1,
+ "trans_pseudocount": 0.1,
+ "has_numba": true,
+ "python": "3.11.17",
+ "numpy": "1.26.4",
+ "cpu_count": 16,
+ "total_seconds": 1807.4992750999518
+}

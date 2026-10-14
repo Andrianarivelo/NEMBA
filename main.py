@@ -5,6 +5,8 @@ opens the GUI. With arguments it runs the CLI:
 
     python main.py --gui                                   # force the GUI
     python main.py --list                                  # list backbones (+ CPU cost)
+    python main.py --advise --file data.npy                # what is this data? what to do?
+    python main.py --auto --file data.npy --behavior b.csv # run the advisor's pipeline
     python main.py --demo --backbone tcn --speed fast      # synthetic data with ground truth
     python main.py --backbone tcn --input spikes --file spikes.npy \
                    --behavior behaviour.csv --circular head_direction --out out
@@ -34,9 +36,16 @@ def build_parser():
     ap.add_argument("--gui", action="store_true", help="launch the GUI")
     ap.add_argument("--list", action="store_true", help="list available backbones")
     ap.add_argument("--demo", action="store_true", help="synthetic recording with known behaviour")
+    ap.add_argument("--advise", action="store_true",
+                    help="profile the data and print / save the recommended pipeline")
+    ap.add_argument("--auto", action="store_true", help="run the advisor's recommended pipeline")
+    ap.add_argument("--goal", default="auto", choices=["auto", "decode", "states", "visualize"],
+                    help="what the advisor should optimise for")
     g = ap.add_argument_group("data")
-    g.add_argument("--input", default="spikes",
-                   choices=["spikes", "pose", "mask", "coco_mask", "fiber_photometry", "timeseries"])
+    g.add_argument("--input", default="auto",
+                   choices=["auto", "spikes", "pose", "mask", "coco_mask", "fiber_photometry",
+                            "timeseries"],
+                   help="'auto' recognises spike times, COCO, DeepLabCut CSV and matrices")
     g.add_argument("--file", default=None, help="data file (.npy/.npz/.csv/.json/.pkl); empty = demo")
     g.add_argument("--bin-size", type=float, default=0.2, help="spike bin size (s)")
     g.add_argument("--time-axis", type=int, default=1)
@@ -51,6 +60,12 @@ def build_parser():
     g.add_argument("--speed", default="fast", choices=["fast", "balanced", "accurate"],
                    help="CPU budget preset (steps, window, width, time cap)")
     g.add_argument("--objective", default="masked", choices=["masked", "contrastive", "hybrid"])
+    g.add_argument("--likelihood", default="gaussian", choices=["gaussian", "poisson", "auto"],
+                   help="poisson / auto use raw spike counts")
+    g.add_argument("--mask-mode", default="time", choices=["time", "neuron", "both"])
+    g.add_argument("--state-model", default="auto", choices=["auto", "kmeans", "hmm", "arhmm"])
+    g.add_argument("--cosmooth", action="store_true",
+                   help="also score co-smoothing (bits/spike on held-out neurons)")
     g.add_argument("--max-steps", type=int, default=None, help="override the preset step budget")
     g.add_argument("--epochs", type=int, default=None, help="legacy: epochs -> step budget")
     g.add_argument("--time-budget", type=float, default=None,
@@ -90,6 +105,7 @@ def cli(argv):
 
     # ---- load data (and behaviour) once ----
     behavior, behavior_times = None, None
+    columns = None
     circular = [c.strip() for c in args.circular.split(",") if c.strip()]
     bin_size = args.bin_size
     if args.demo or not args.file:
@@ -99,6 +115,16 @@ def cli(argv):
         data, input_kind, bin_size = ds["spike_times"], "spikes", ds["dt"]
         behavior, behavior_times = ds["behavior"], ds["times"]
         circular = circular or ["phase"]
+    elif args.input == "auto":
+        data, hints = D.load_auto(args.file)
+        columns = hints.get("columns")
+        input_kind = {"spike_times": "spikes", "coco": "coco_mask", "pose": "pose"}.get(
+            hints["kind"], "timeseries")
+        if args.fs is None and hints.get("fs"):
+            args.fs = hints["fs"]
+        if hints["kind"] in ("pose", "table"):
+            args.time_axis = 0                         # rows of a table are time
+        print(f"[auto] {args.file}: detected {hints['kind']}")
     elif args.input == "spikes":
         data, input_kind = D.load_spikes(args.file), "spikes"
     elif args.input == "coco_mask" or (args.input == "mask" and args.file.endswith(".json")):
@@ -114,7 +140,27 @@ def cli(argv):
     common = dict(bin_size=bin_size, n_states=args.states, speed=args.speed,
                   objective=args.objective, max_steps=args.max_steps, epochs=args.epochs,
                   time_budget_s=budget, smooth_sigma=args.smooth, input_pca=input_pca,
-                  seed=args.seed, device="auto")
+                  seed=args.seed, device="auto", likelihood=args.likelihood,
+                  mask_mode=args.mask_mode, state_model=args.state_model)
+
+    # ---- advisor: describe the data, suggest (and optionally run) a pipeline ----
+    if args.advise or args.auto:
+        from embedders_backbones.advisor import advise, profile_figure
+        from embedders_backbones import viz as V
+        rec = advise(data if input_kind != "coco_mask" else {"images": [], "annotations": []},
+                     goal=args.goal, fs=args.fs, behavior=behavior, behavior_times=behavior_times,
+                     columns=columns,
+                     time_axis=0 if args.time_axis == 0 and args.input == "auto" else "auto")
+        os.makedirs(args.out, exist_ok=True)
+        rec.save(os.path.join(args.out, "advice"))
+        V.save_figure(profile_figure(rec.profile), os.path.join(args.out, "data_profile"))
+        print(rec.report())
+        print()
+        print(f"advice saved to {os.path.join(args.out, 'advice.md')}")
+        if args.auto:
+            rec.run(data, args.out, behavior=behavior, behavior_times=behavior_times)
+            print(f"outputs in {args.out}")
+        return
 
     # ---- compare several backbones ----
     if args.compare:
@@ -143,6 +189,8 @@ def cli(argv):
         emb.fit_fiber(data, time_axis=args.time_axis, dff=args.dff, fs=args.fs)
     else:
         emb.fit_features(data, time_axis=args.time_axis)
+    if args.cosmooth:
+        emb.cosmooth()
     met = emb.run(args.out, behavior=behavior, behavior_times=behavior_times, circular=circular,
                   animate=not args.no_gif, gif_method=args.gif_method, html=not args.no_html,
                   n_perm=args.n_perm)

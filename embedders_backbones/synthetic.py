@@ -87,6 +87,111 @@ def make_dataset(n_neurons=60, duration=600.0, dt=0.1, n_states=3, mean_dwell_s=
                 dt=dt)
 
 
+def _markov_states(T, n_states, p_stay, rng):
+    """Discrete Markov chain with geometric dwell times."""
+    s = np.empty(T, dtype=int)
+    s[0] = rng.integers(n_states)
+    for t in range(1, T):
+        s[t] = s[t - 1] if rng.random() < p_stay else rng.choice(
+            [k for k in range(n_states) if k != s[t - 1]])
+    return s
+
+
+def make_metastable(n_neurons=40, duration=400.0, dt=0.1, n_states=4, mean_dwell_s=8.0,
+                    seed=0):
+    """Discrete metastable population states (no continuous manifold): each state
+    has its own random rate pattern. Returns dict like ``make_dataset``."""
+    rng = np.random.default_rng(seed)
+    T = int(round(duration / dt))
+    state = _markov_states(T, n_states, np.exp(-dt / mean_dwell_s), rng)
+    patterns = rng.gamma(2.0, 3.0, (n_states, n_neurons))
+    counts = rng.poisson(patterns[state].T * dt).astype(np.float32)
+    return dict(counts=counts, times=(np.arange(T) + 0.5) * dt, dt=dt,
+                behavior=dict(state=state))
+
+
+def make_sheet(n_neurons=60, duration=600.0, dt=0.1, seed=0):
+    """Continuous 2-D latent without a loop (animal in an open box, place-like
+    tuning): a sheet manifold, H1 persistence should stay low."""
+    rng = np.random.default_rng(seed)
+    T = int(round(duration / dt))
+    pos = np.zeros((T, 2))
+    v = np.zeros(2)
+    for t in range(1, T):                      # reflected random walk in [0, 1]^2
+        v = 0.95 * v + 0.01 * rng.normal(size=2)
+        pos[t] = pos[t - 1] + v
+        for d in range(2):
+            if pos[t, d] < 0 or pos[t, d] > 1:
+                v[d] = -v[d]; pos[t, d] = np.clip(pos[t, d], 0, 1)
+    centres = rng.uniform(0, 1, (n_neurons, 2))
+    d2 = ((pos[None] - centres[:, None]) ** 2).sum(-1)
+    rates = 0.5 + 15.0 * np.exp(-d2 / (2 * 0.12 ** 2))
+    counts = rng.poisson(rates * dt).astype(np.float32)
+    return dict(counts=counts, times=(np.arange(T) + 0.5) * dt, dt=dt,
+                behavior=dict(x=pos[:, 0], y=pos[:, 1]))
+
+
+def make_calcium(n_neurons=60, duration=600.0, fs=10.0, tau_decay_s=0.6, seed=0):
+    """Calcium-imaging-like traces (dF/F): spikes from the ring + state model of
+    ``make_dataset`` convolved with an exponential decay plus noise. Returns
+    dict(traces [N, T], times, fs, behavior)."""
+    ds = make_dataset(n_neurons=n_neurons, duration=duration, dt=1.0 / fs, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    k = np.exp(-np.arange(int(5 * tau_decay_s * fs)) / (tau_decay_s * fs))
+    traces = np.array([np.convolve(c, k)[: c.size] for c in ds["counts"]])
+    traces = 0.4 * traces + 0.08 * rng.normal(size=traces.shape)
+    return dict(traces=traces.astype(np.float32), times=ds["times"], fs=fs,
+                behavior=ds["behavior"])
+
+
+def make_photometry(duration=600.0, fs=20.0, n_channels=1, seed=0):
+    """Fiber photometry: photobleaching decay + event transients + slow drift +
+    motion artefacts shared with an isosbestic control channel.
+    Returns dict(signal [C, T], control [C, T], times, fs, behavior)."""
+    rng = np.random.default_rng(seed)
+    T = int(round(duration * fs))
+    t = np.arange(T) / fs
+    events = rng.random(T) < 0.15 / fs                       # ~0.15 events per second
+    kern = np.exp(-np.arange(int(4 * fs)) / (0.8 * fs)) - np.exp(-np.arange(int(4 * fs)) / (0.1 * fs))
+    transients = np.convolve(events.astype(float), kern)[:T]
+    motion = np.convolve(rng.normal(size=T), np.ones(int(fs)) / fs, "same") * 0.3
+    sig, ctl = [], []
+    for c in range(n_channels):
+        bleach = 1.0 + 0.6 * np.exp(-t / (150 + 50 * c))
+        sig.append(bleach * (1.0 + 0.15 * transients + 0.03 * motion) + 0.01 * rng.normal(size=T))
+        ctl.append(bleach * (1.0 + 0.03 * motion) + 0.01 * rng.normal(size=T))
+    return dict(signal=np.array(sig, np.float32), control=np.array(ctl, np.float32), times=t,
+                fs=fs, behavior=dict(event=events.astype(int)))
+
+
+def make_pose(n_keypoints=8, duration=300.0, fps=30.0, nan_frac=0.02, seed=0):
+    """DeepLabCut-like pose: keypoints of a rigid-ish body moving in an arena
+    with three behavioural states (rest / walk / groom) and tracking dropouts.
+    Returns dict(X [T, 2K] with columns '<part>_x', '<part>_y', columns,
+    times, fps, behavior)."""
+    rng = np.random.default_rng(seed)
+    T = int(round(duration * fps))
+    state = _markov_states(T, 3, np.exp(-1.0 / (fps * 4.0)), rng)
+    speed = np.array([0.2, 6.0, 0.5])[state] * (1 + 0.3 * rng.normal(size=T)).clip(0.2)
+    heading = np.cumsum(rng.normal(0, 0.05, T) + (state == 2) * 0.15)
+    pos = np.cumsum(np.c_[np.cos(heading), np.sin(heading)] * speed[:, None] / fps, 0)
+    pos = (pos - pos.min(0)) / (np.ptp(pos, 0) + 1e-9) * 400 + 50
+    template = np.c_[np.linspace(-30, 30, n_keypoints), rng.normal(0, 6, n_keypoints)]
+    groom = (state == 2)[:, None] * 6 * np.sin(np.arange(T) / fps * 2 * np.pi * 5)[:, None]
+    X = np.empty((T, 2 * n_keypoints))
+    for k in range(n_keypoints):
+        ox, oy = template[k]
+        X[:, 2 * k] = pos[:, 0] + ox * np.cos(heading) - oy * np.sin(heading) + rng.normal(0, 1.5, T)
+        X[:, 2 * k + 1] = pos[:, 1] + ox * np.sin(heading) + oy * np.cos(heading) + groom[:, 0] \
+            + rng.normal(0, 1.5, T)
+    drop = rng.random((T, n_keypoints)) < nan_frac             # dropouts hit x and y together
+    for k in range(n_keypoints):
+        X[drop[:, k], 2 * k:2 * k + 2] = np.nan
+    names = [f"part{k}_{a}" for k in range(n_keypoints) for a in ("x", "y")]
+    return dict(X=X.astype(np.float32), columns=names, times=np.arange(T) / fps, fps=fps,
+                behavior=dict(state=state, speed=speed))
+
+
 def demo_spikes(n=40, dur=400.0, dt=0.05, seed=0):
     """The v0.1 GUI demo: a population tuned to a slowly drifting ring phase."""
     rng = np.random.default_rng(seed); T = int(dur / dt); t = np.arange(T) * dt

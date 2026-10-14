@@ -35,7 +35,7 @@ _HAS_RIPSER = importlib.util.find_spec("ripser") is not None
 # Default number of frames shown per projection method. Uniform *strided*
 # subsampling keeps trajectories continuous while bounding CPU time
 # (t-SNE is O(n log n) with a large constant; UMAP has a numba JIT warm-up).
-MAX_POINTS = {"pca": 20000, "umap": 3000, "tsne": 2500}
+MAX_POINTS = {"pca": 20000, "umap": 3000, "tsne": 2500, "tphate": 3000}
 
 
 def smooth_standardize(Z, sigma=4.0, return_stats=False):
@@ -185,13 +185,22 @@ def project(Z, method="umap", seed=0):
         # epochs instead of 500 keep it to a few seconds for a few thousand points
         return umap.UMAP(n_neighbors=30, min_dist=0.1, n_epochs=200, random_state=seed,
                          n_jobs=1).fit_transform(Z)
+    if method in ("tphate", "t-phate"):
+        from .manifold import tphate
+        return tphate(Z, max_points=len(Z), seed=seed)[0]
     raise ValueError(f"unknown projection {method!r}")
 
 
 def project_subset(Z, method="umap", seed=0, max_points=None):
-    """Project a strided subset of frames. Returns (P [n, 2], idx [n])."""
-    m = method.lower().replace("t-sne", "tsne")
+    """Project a strided subset of frames. Returns (P [n, 2], idx [n]).
+
+    'tphate' is the time-aware T-PHATE-style projection (``manifold.tphate``,
+    a native re-implementation of Busch et al. 2023)."""
+    m = method.lower().replace("t-sne", "tsne").replace("t-phate", "tphate")
     mp = MAX_POINTS.get(m, 5000) if max_points is None else max_points
+    if m == "tphate":
+        from .manifold import tphate
+        return tphate(Z, max_points=mp, seed=seed)
     idx = subsample_index(len(Z), mp)
     return project(Z[idx], m, seed), idx
 
